@@ -99,7 +99,8 @@ def inject_krx_market(data_folder: str | Path) -> None:
     if not rows or rows[0] != _SYMBOL_PROPERTIES_HEADER:
         rows = [_SYMBOL_PROPERTIES_HEADER] + [r for r in rows if r != _SYMBOL_PROPERTIES_HEADER]
     key = (_KRX_EQUITY_ROW[0], _KRX_EQUITY_ROW[1], _KRX_EQUITY_ROW[2])
-    if not any((r[0], r[1], r[2]) == key for r in rows[1:]):
+    # LEAN 원본 CSV의 '#' 주석/짧은 행은 키 비교에서 건너뛴다(그대로 보존)
+    if not any(len(r) >= 3 and (r[0], r[1], r[2]) == key for r in rows[1:]):
         rows.append(_KRX_EQUITY_ROW)
     sp.parent.mkdir(parents=True, exist_ok=True)
     with open(sp, "w", newline="", encoding="utf-8") as f:

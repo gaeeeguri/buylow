@@ -65,3 +65,21 @@ def test_inject_preserves_existing_and_is_idempotent(tmp_path):
         rows = list(csv.reader(f))
     krx_rows = [r for r in rows[1:] if r[0] == KRX_MARKET]
     assert len(krx_rows) == 1  # 멱등
+
+
+def test_inject_tolerates_lean_comment_and_blank_rows(tmp_path):
+    # 실제 LEAN Data/symbol-properties CSV는 '#' 주석·짧은 행으로 시작한다 — 주입이 죽으면 안 됨.
+    sp_dir = tmp_path / "symbol-properties"
+    sp_dir.mkdir()
+    (sp_dir / "symbol-properties-database.csv").write_text(
+        "market,symbol,type,description,quote_currency,contract_multiplier,minimum_price_variation,lot_size\n"
+        "\n#\n# Use # signs for comments\n#\n"
+        "usa,[*],equity,,USD,1,0.01,1\n"
+    )
+
+    inject_krx_market(tmp_path)
+
+    with open(sp_dir / "symbol-properties-database.csv") as f:
+        rows = list(csv.reader(f))
+    assert ["usa", "[*]", "equity", "", "USD", "1", "0.01", "1"] in rows  # 기존 보존
+    assert len([r for r in rows if r and r[0] == KRX_MARKET]) == 1
