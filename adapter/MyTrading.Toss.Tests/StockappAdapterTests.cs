@@ -69,6 +69,20 @@ namespace MyTrading.Toss.Tests
     public class OrderPolicyTests
     {
         [Fact]
+        public void Guardrails_fail_closed_without_a_cap_or_kr_price_limits()
+        {
+            const string tag = "000007-0000ya-001-01";
+            var noCap = Fixture.Settings();
+            noCap.MaxOrderKrw = 0m;
+            noCap.MaxOrderUsd = 0m;
+            Assert.StartsWith("no max order amount", OrderPolicy.Check(noCap, tag, "KR", 1, 70000m, (49000m, 91000m)));
+            Assert.StartsWith("no max order amount", OrderPolicy.Check(noCap, tag, "US", 1, 10m, null));
+            // Toss answered without limits for a KR symbol: unknown limits refuse, they don't skip the check
+            Assert.StartsWith("today's price limits are unknown", OrderPolicy.Check(Fixture.Settings(), tag, "KR", 1, 70000m, null));
+            Assert.Null(OrderPolicy.Check(Fixture.Settings(), tag, "US", 1, 10m, null));  // US has no /price-limits
+        }
+
+        [Fact]
         public void Kr_orders_are_opg_with_whole_won_and_us_orders_are_day_with_cents()
         {
             var kr = JObject.Parse(OrderPolicy.Body("000007-0000ya-001-01", "005930", "KR", true, 2, 72100m));

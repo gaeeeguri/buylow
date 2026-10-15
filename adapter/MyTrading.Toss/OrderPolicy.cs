@@ -51,10 +51,13 @@ namespace MyTrading.Toss
             if (!s.TradingEnabled) return "trading is disabled for this run (alert-only)";
             if (!IsClientOrderId(tag)) return "the order carries no stockapp client order id";
             if (qty <= 0 || limit <= 0) return "quantity and limit price must be positive";
+            // Fail closed: a missing cap or unknown KR limits refuse the order rather than skip the check.
             var max = market == "KR" ? s.MaxOrderKrw : s.MaxOrderUsd;
+            if (max <= 0) return $"no max order amount is set for {market} (toss-max-order-{(market == "KR" ? "krw" : "usd")})";
             var amount = qty * limit;
-            if (max > 0 && amount > max)
+            if (amount > max)
                 return $"max order amount: {amount.ToString(CultureInfo.InvariantCulture)} > {max.ToString(CultureInfo.InvariantCulture)}";
+            if (market == "KR" && !priceLimits.HasValue) return "today's price limits are unknown (Toss /price-limits gave none)";
             if (priceLimits.HasValue && (limit < priceLimits.Value.lower || limit > priceLimits.Value.upper))
                 return $"price {limit.ToString(CultureInfo.InvariantCulture)} is outside today's limits " +
                        $"{priceLimits.Value.lower.ToString(CultureInfo.InvariantCulture)}–{priceLimits.Value.upper.ToString(CultureInfo.InvariantCulture)}";
