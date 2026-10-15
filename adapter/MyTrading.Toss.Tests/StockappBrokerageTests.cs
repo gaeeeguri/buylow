@@ -14,6 +14,7 @@ using System.Net.Http;
 using MyTrading.Toss;
 using Newtonsoft.Json.Linq;
 using QuantConnect;
+using QuantConnect.Brokerages;
 using QuantConnect.Data;
 using QuantConnect.Data.Market;
 using QuantConnect.Interfaces;
@@ -121,6 +122,27 @@ namespace MyTrading.Toss.Tests
             Assert.True(b.PlaceOrder(order));
             Assert.Empty(events);
             Assert.Empty(order.BrokerId);
+        }
+
+        [Fact]
+        public void A_rejection_after_an_uncertain_send_stays_uncertain_until_matching_decides()
+        {
+            // Toss may have created the order on the first POST; a 4xx on the resend doesn't prove it didn't
+            // (stockapp spec §7.4: same-id behaviour for accepted orders is unverified, field matching decides).
+            var (b, h, events) = Make(true);
+            var messages = new List<BrokerageMessageEvent>();
+            b.Message += (_, m) => messages.Add(m);
+            h.On("GET /api/v1/price-limits", SequenceHandler.Json(HttpStatusCode.OK, "{\"result\":{\"lowerLimitPrice\":\"49000\",\"upperLimitPrice\":\"91000\"}}"));
+            h.On("POST /api/v1/orders", () => null,
+                SequenceHandler.Json(HttpStatusCode.Conflict, "{\"error\":{\"code\":\"duplicate-order\",\"message\":\"exists\"}}"));
+            var order = new LimitOrder(new TossSymbolMapper().LeanSymbol("005930", "KR"), 2, 72100m, DateTime.UtcNow, "000007-0000ya-001-01");
+            Assert.True(b.PlaceOrder(order));
+            b.ResendUncertain(DateTime.UtcNow.AddSeconds(10));
+            Assert.Equal(2, h.Seen.Count(s => s.key.StartsWith("POST")));
+            Assert.Empty(events);                                   // not reported Invalid
+            b.ResendUncertain(DateTime.UtcNow.AddMinutes(9));
+            Assert.Equal("toss-unknown", Assert.Single(messages).Code);
+            Assert.Equal("000007-0000ya-001-01", messages[0].Message);
         }
     }
 }

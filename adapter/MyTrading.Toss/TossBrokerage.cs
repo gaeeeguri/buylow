@@ -4,7 +4,8 @@
  *
  * - Orders: only LIMIT orders whose tag is a stockapp client order id (persisted in stockapp's
  *   ledger before LEAN sees the order). KR → OPG LIMIT, US → DAY LIMIT. Stateless guardrails run
- *   first (OrderPolicy). A send whose outcome is unknown (transport error, timeout, 5xx, 409) is
+ *   first (OrderPolicy). A send whose outcome is unknown (transport error, timeout, 5xx,
+ *   request-in-progress, or any answer to a resend of such a send: Toss may already hold the order) is
  *   resent with the same clientOrderId every 5 s, inside Toss's 10-minute idempotency window,
  *   until Toss answers or 8 minutes have passed; then the adapter reports `toss-unknown` and
  *   never sends it again (stockapp resolves it by field matching and pauses the strategy).
@@ -50,7 +51,7 @@ namespace MyTrading.Toss
             catch { /* already registered */ }
         }
 
-        private class Pending { public Order Order; public string Body; public DateTime First; public DateTime Next; }
+        private class Pending { public Order Order; public string Body; public DateTime First; public DateTime Next; public bool Resend; }
 
         private readonly IAlgorithm _algorithm;
         private readonly TossSettings _settings;
@@ -167,11 +168,15 @@ namespace MyTrading.Toss
                     _tracker.Track(outcome.OrderId);
                     Report(p.Order, OrderStatus.Submitted, Toss("PENDING", outcome.OrderId));
                     return true;
-                case SendKind.Rejected:
+                // A rejection is definite only for a first send. After an uncertain send, Toss may already
+                // hold the order, and a 4xx on the resend doesn't prove otherwise (stockapp spec §7.4: same-id
+                // behaviour for accepted orders is unverified), so it stays uncertain and field matching decides.
+                case SendKind.Rejected when !p.Resend:
                     _uncertain.TryRemove(p.Order.Id, out _);
                     Report(p.Order, OrderStatus.Invalid, Toss("REJECTED", null, outcome.Code, outcome.Message));
                     return false;
                 default:
+                    p.Resend = true;
                     p.Next = DateTime.UtcNow.AddSeconds(Math.Max(5, outcome.RetryAfterSeconds));
                     _uncertain[p.Order.Id] = p;
                     Log.Trace($"TossBrokerage: send of {p.Order.Tag} uncertain ({outcome.Code}); resending the same id");
@@ -280,15 +285,7 @@ namespace MyTrading.Toss
         private void Poll()
         {
             var now = DateTime.UtcNow;
-            foreach (var p in _uncertain.Values.ToArray())
-            {
-                if (now - p.First >= _settings.UnknownAfter)
-                {
-                    _uncertain.TryRemove(p.Order.Id, out _);
-                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "toss-unknown", p.Order.Tag));
-                }
-                else if (now >= p.Next) Send(p);
-            }
+            ResendUncertain(now);
             var socketUp = _socket?.Connected == true;
             if (now - _lastOrderPoll >= TimeSpan.FromSeconds(socketUp ? 30 : 3))
             {
@@ -314,6 +311,21 @@ namespace MyTrading.Toss
             {
                 _authReported = true;
                 OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "toss-auth", "Toss refused the access token"));
+            }
+        }
+
+        /// <summary>The poller's resend step: resends uncertain sends that are due with the same client order
+        /// id, and reports `toss-unknown` for those past `UnknownAfter`, never sending them again.</summary>
+        public void ResendUncertain(DateTime now)
+        {
+            foreach (var p in _uncertain.Values.ToArray())
+            {
+                if (now - p.First >= _settings.UnknownAfter)
+                {
+                    _uncertain.TryRemove(p.Order.Id, out _);
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "toss-unknown", p.Order.Tag));
+                }
+                else if (now >= p.Next) Send(p);
             }
         }
 
