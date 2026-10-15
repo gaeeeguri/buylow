@@ -2,6 +2,7 @@
  * LEAN Symbol ↔ 토스 종목코드 매핑.
  *
  * KRX 종목은 6자리 숫자 코드(예: 005930)이며 LEAN Symbol.Value와 동일하게 쓴다(market="krx").
+ * stockapp: US 종목은 티커 그대로(market="usa").
  * KIS 어댑터(KisSymbolMapper)와 동일 — 어댑터 계약상 ISymbolMapper로 분리해 둔다.
  */
 
@@ -20,6 +21,13 @@ namespace MyTrading.Toss
                 throw new ArgumentException("유효한 Symbol이 아닙니다.", nameof(symbol));
             return symbol.Value;
         }
+
+        /// <summary>stockapp: a ledger symbol and its market ("KR" | "US") → LEAN equity Symbol.</summary>
+        /// Built without map files (stockapp's live data folder has none; prices are raw), which gives the
+        /// same identifier LEAN's add_equity assigns there.
+        public Symbol LeanSymbol(string symbol, string market) =>
+            new Symbol(SecurityIdentifier.GenerateEquity(symbol, market == "US" ? QuantConnect.Market.USA : TossConstants.KrxMarket,
+                                                         mapSymbol: false), symbol);
 
         /// <summary>토스 코드 → LEAN Symbol (market=krx, equity).</summary>
         public Symbol GetLeanSymbol(string brokerageSymbol, SecurityType securityType, string market,

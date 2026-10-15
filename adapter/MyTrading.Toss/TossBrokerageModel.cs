@@ -37,6 +37,20 @@ namespace MyTrading.Toss
         }
     }
 
+    /// <summary>stockapp: US commission (percent of value, USD). stockapp's ledger books Toss's reported
+    /// fees; this model only keeps LEAN's own estimates sensible.</summary>
+    public class UsPercentFeeModel : FeeModel
+    {
+        private const decimal Rate = 0.001m;  // 0.1%, stockapp's default US commission
+
+        public override OrderFee GetOrderFee(OrderFeeParameters parameters)
+        {
+            var order = parameters.Order;
+            var price = order.Price != 0 ? order.Price : parameters.Security.Price;
+            return new OrderFee(new CashAmount(order.AbsoluteQuantity * price * Rate, TossConstants.UsdCurrency));
+        }
+    }
+
     public class TossBrokerageModel : DefaultBrokerageModel
     {
         private static readonly IReadOnlyDictionary<SecurityType, string> KrxMarkets =
@@ -46,7 +60,8 @@ namespace MyTrading.Toss
 
         public override IReadOnlyDictionary<SecurityType, string> DefaultMarkets => KrxMarkets;
 
-        public override IFeeModel GetFeeModel(Security security) => new KoreanFeeModel();
+        public override IFeeModel GetFeeModel(Security security) =>
+            security.Symbol.ID.Market == TossConstants.KrxMarket ? new KoreanFeeModel() : new UsPercentFeeModel();
 
         /// <summary>현금계좌 + 한국주식은 레버리지 1.</summary>
         public override decimal GetLeverage(Security security) => 1m;
