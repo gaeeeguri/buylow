@@ -13,8 +13,10 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Net.Http;
 using System.Text;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using QuantConnect.Logging;
@@ -54,6 +56,7 @@ namespace MyTrading.Toss
     public class TossOrderStatus
     {
         public bool Found;
+        public string OrderId;
         public string Status;       // PENDING/PARTIAL_FILLED/FILLED/CANCELED/REJECTED/EXPIRED ...
         public bool Buy;
         public string Symbol;
@@ -87,6 +90,21 @@ namespace MyTrading.Toss
         public decimal LastPrice;
     }
 
+    /// <summary>One order POST's outcome (stockapp spec §7.4). Rejected: Toss answered and created no
+    /// order. Uncertain: the outcome is unknown (transport error, timeout, 5xx, 409 request-in-progress),
+    /// so the same clientOrderId must be sent again, never a new one.</summary>
+    public enum SendKind { Accepted, Rejected, Uncertain }
+
+    public class SendOutcome
+    {
+        public SendKind Kind;
+        public string OrderId;
+        public int Status;
+        public string Code;
+        public string Message;
+        public double RetryAfterSeconds;
+    }
+
     /// <summary>토스 REST 오류.</summary>
     public class TossException : Exception
     {
@@ -95,6 +113,7 @@ namespace MyTrading.Toss
 
     public class TossRestClient
     {
+        private readonly TokenFileProvider _tokenFile;  // stockapp: tokens come from the backend's file
         private readonly string _clientId;
         private readonly string _clientSecret;
         private readonly string _baseUrl;
@@ -126,9 +145,35 @@ namespace MyTrading.Toss
             _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
         }
 
+        /// <summary>stockapp: no client secret; the bearer token is read from the backend's token file.</summary>
+        public TossRestClient(TokenFileProvider tokens, string baseUrl, HttpClient http)
+        {
+            _tokenFile = tokens ?? throw new TossException("a token file is required");
+            _baseUrl = string.IsNullOrEmpty(baseUrl) ? TossConstants.RestUrl : baseUrl.TrimEnd('/');
+            _http = http;
+        }
+
+        /// <summary>An HttpClient through stockapp's SOCKS5 tunnel (stockapp spec §10); "" or "direct": none.</summary>
+        public static HttpClient CreateHttp(string proxy, TimeSpan timeout)
+        {
+            var handler = new SocketsHttpHandler();
+            if (!string.IsNullOrEmpty(proxy) && proxy != "direct")
+            {
+                handler.Proxy = new WebProxy(proxy);
+                handler.UseProxy = true;
+            }
+            else
+            {
+                handler.UseProxy = false;
+            }
+            return new HttpClient(handler) { Timeout = timeout };
+        }
+
         // ── 토큰 ───────────────────────────────────────────────────────────
         public string AccessToken()
         {
+            if (_tokenFile != null)
+                return _tokenFile.Token();
             lock (_tokenLock)
             {
                 if (_token != null && _tokenExpiry > DateTime.UtcNow.AddMinutes(1))
@@ -137,6 +182,20 @@ namespace MyTrading.Toss
                     return _token;
                 return IssueToken();
             }
+        }
+
+        /// <summary>Sends a request built by `build`; after a 401 in stockapp mode, rereads the token file and
+        /// sends once more (the backend may have refreshed the token).</summary>
+        private HttpResponseMessage Send(Func<HttpRequestMessage> build)
+        {
+            var resp = _http.Send(build());
+            if (resp.StatusCode == HttpStatusCode.Unauthorized && _tokenFile != null)
+            {
+                resp.Dispose();
+                _tokenFile.Invalidate();
+                resp = _http.Send(build());
+            }
+            return resp;
         }
 
         private string CacheId() => _clientId.Length >= 12 ? _clientId.Substring(0, 12) : _clientId;
@@ -226,10 +285,9 @@ namespace MyTrading.Toss
                 foreach (var kv in query)
                     sb.Append(Uri.EscapeDataString(kv.Key)).Append('=').Append(Uri.EscapeDataString(kv.Value)).Append('&');
             }
-            using (var req = new HttpRequestMessage(HttpMethod.Get, sb.ToString().TrimEnd('&', '?')))
+            var url = sb.ToString().TrimEnd('&', '?');
             {
-                AddAuth(req, account);
-                var resp = _http.Send(req);
+                var resp = Send(() => { var r = new HttpRequestMessage(HttpMethod.Get, url); AddAuth(r, account); return r; });
                 var text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
                 if (!resp.IsSuccessStatusCode)
                     throw new TossException($"{path} HTTP {(int)resp.StatusCode} {Trunc(text)}");
@@ -241,11 +299,14 @@ namespace MyTrading.Toss
         /// <summary>POST(JSON 본문) — (성공여부, result, 오류메시지/코드).</summary>
         private (bool ok, JToken result, string message, string code) PostJson(string path, string json, bool account)
         {
-            using (var req = new HttpRequestMessage(HttpMethod.Post, _baseUrl + path))
             {
-                req.Content = new StringContent(json ?? "{}", Encoding.UTF8, "application/json");
-                AddAuth(req, account);
-                var resp = _http.Send(req);
+                var resp = Send(() =>
+                {
+                    var r = new HttpRequestMessage(HttpMethod.Post, _baseUrl + path)
+                    { Content = new StringContent(json ?? "{}", Encoding.UTF8, "application/json") };
+                    AddAuth(r, account);
+                    return r;
+                });
                 var text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
                 JObject data = null;
                 try { data = string.IsNullOrEmpty(text) ? null : JObject.Parse(text); } catch { }
@@ -420,6 +481,83 @@ namespace MyTrading.Toss
             }
         }
 
+        /// <summary>stockapp: one order POST, classified (stockapp spec §7.4). A 429 is answered before Toss
+        /// processes the order, so it is retried here after Retry-After; everything else is the caller's.</summary>
+        public SendOutcome SendOrderOnce(string body)
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                lock (_orderGate)
+                {
+                    var since = DateTime.UtcNow - _lastOrderAt;
+                    if (since < OrderMinInterval) System.Threading.Thread.Sleep(OrderMinInterval - since);
+                    _lastOrderAt = DateTime.UtcNow;
+                }
+                HttpResponseMessage resp;
+                string text;
+                try
+                {
+                    resp = Send(() =>
+                    {
+                        var r = new HttpRequestMessage(HttpMethod.Post, _baseUrl + TossConstants.PathOrders)
+                        { Content = new StringContent(body, Encoding.UTF8, "application/json") };
+                        AddAuth(r, true);
+                        return r;
+                    });
+                    text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                }
+                catch (Exception e) when (e is HttpRequestException || e is TaskCanceledException || e is IOException)
+                {
+                    return new SendOutcome { Kind = SendKind.Uncertain, Code = "transport", Message = e.GetType().Name };
+                }
+                var status = (int)resp.StatusCode;
+                JObject data = null;
+                try { data = string.IsNullOrEmpty(text) ? null : JObject.Parse(text); } catch { }
+                var err = data?["error"] as JObject;
+                var outcome = new SendOutcome
+                {
+                    Status = status,
+                    Code = err?.Value<string>("code") ?? status.ToString(CultureInfo.InvariantCulture),
+                    Message = err?.Value<string>("message") ?? Trunc(text),
+                    RetryAfterSeconds = (double?)(err?["data"]?["retryAfterSeconds"]) ?? 0,
+                };
+                if (resp.IsSuccessStatusCode)
+                {
+                    outcome.Kind = SendKind.Accepted;
+                    outcome.OrderId = (data?["result"] as JObject)?.Value<string>("orderId");
+                    outcome.Code = null;
+                    outcome.Message = null;
+                    if (string.IsNullOrEmpty(outcome.OrderId)) outcome.Kind = SendKind.Uncertain;  // accepted but unreadable
+                    return outcome;
+                }
+                if (status == 429 && attempt < OrderMaxAttempts)
+                {
+                    var wait = resp.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(1);
+                    System.Threading.Thread.Sleep(wait < TimeSpan.FromSeconds(60) ? wait : TimeSpan.FromSeconds(60));
+                    continue;
+                }
+                outcome.Kind = status >= 400 && status < 500 && status != 429 && outcome.Code != "request-in-progress"
+                    ? SendKind.Rejected : SendKind.Uncertain;
+                return outcome;
+            }
+        }
+
+        /// <summary>KR daily price limits, or null when Toss has none (US: 404).</summary>
+        public (decimal lower, decimal upper)? GetPriceLimits(string symbol)
+        {
+            try
+            {
+                var r = GetResult(TossConstants.PathPriceLimits, new Dictionary<string, string> { ["symbol"] = symbol }, false) as JObject;
+                var lower = Dec(r?["lowerLimitPrice"]);
+                var upper = Dec(r?["upperLimitPrice"]);
+                return lower > 0 && upper > 0 ? (lower, upper) : ((decimal, decimal)?)null;
+            }
+            catch (TossException e) when (e.Message.Contains("HTTP 404"))
+            {
+                return null;
+            }
+        }
+
         /// <summary>주문 상세 — 체결 폴링용. 미존재/오류면 Found=false.</summary>
         public TossOrderStatus GetOrder(string orderId)
         {
@@ -431,6 +569,7 @@ namespace MyTrading.Toss
                 return new TossOrderStatus
                 {
                     Found = true,
+                    OrderId = o.Value<string>("orderId") ?? orderId,
                     Status = o.Value<string>("status"),
                     Buy = o.Value<string>("side") == "BUY",
                     Symbol = o.Value<string>("symbol"),

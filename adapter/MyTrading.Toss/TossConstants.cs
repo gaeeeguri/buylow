@@ -24,6 +24,10 @@ namespace MyTrading.Toss
         public const string PathOrders = "/api/v1/orders";          // POST 생성 / GET 목록
         public const string PathMarketCalendarKr = "/api/v1/market-calendar/KR";
         public const string PathPrices = "/api/v1/prices";
+        public const string PathPriceLimits = "/api/v1/price-limits";
+
+        // ── stockapp: WebSocket (trade ticks + personal order events, stockapp spec §2.1) ──
+        public const string WsUrl = "wss://openapi-ws.tossinvest.com/ws/v1";
         // 주문 상세/정정/취소는 {orderId}를 경로에 끼운다.
         public static string PathOrder(string orderId) => PathOrders + "/" + orderId;
         public static string PathOrderModify(string orderId) => PathOrder(orderId) + "/modify";
@@ -33,5 +37,6 @@ namespace MyTrading.Toss
         public const string KrxMarket = "krx";
         public const int KrxMarketId = 50;
         public const string KrwCurrency = "KRW";
+        public const string UsdCurrency = "USD";
     }
 }
