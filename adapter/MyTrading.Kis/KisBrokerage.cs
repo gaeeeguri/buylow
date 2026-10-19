@@ -171,7 +171,8 @@ namespace MyTrading.Kis
             var orderId = order.BrokerId.FirstOrDefault();
             if (string.IsNullOrEmpty(orderId)) return false;
             var ok = _rest.Cancel(orderId);
-            Refresh();  // the terminal state comes from the daily orders, never from the cancel answer
+            try { Refresh(); }  // the terminal state comes from the daily orders, never from the cancel answer
+            catch (Exception e) { Log.Trace($"KisBrokerage.CancelOrder: refresh after cancel failed: {e.GetType().Name}: {e.Message}"); }
             return ok;
         }
 
@@ -227,6 +228,10 @@ namespace MyTrading.Kis
                 {
                     var row = rows.FirstOrDefault(r => !r.Revision && r.OrderId == id);
                     if (row == null) continue;
+                    // Not yet known to LEAN (e.g. between GetOpenOrders and AddOpenOrder at startup): leave the
+                    // increment unobserved so a later refresh reports it instead of losing it.
+                    var orders = _ordersByBrokerId(id) ?? new List<Order>();
+                    if (orders.Count == 0) continue;
                     var step = _fills.Observe(row.Snapshot(today));
                     if (step == null) continue;
                     var status = step.Status switch
@@ -237,7 +242,7 @@ namespace MyTrading.Kis
                         TrackedStatus.Canceled => OrderStatus.Canceled,
                         _ => OrderStatus.Submitted,
                     };
-                    foreach (var order in _ordersByBrokerId(id) ?? new List<Order>())
+                    foreach (var order in orders)
                         Report(order, status, step.Message, step.FillQty, step.FillPrice);
                 }
             }

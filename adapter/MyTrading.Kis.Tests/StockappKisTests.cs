@@ -432,6 +432,23 @@ namespace MyTrading.Kis.Tests
         }
 
         [Fact]
+        public void A_fill_seen_before_LEAN_knows_the_order_is_reported_later()
+        {
+            var (b, h, events, _, byId) = Make();
+            Quote(h);
+            h.On("POST " + KisFixture.Cash, KisStub.Json(HttpStatusCode.OK, KisFixture.Ok(KisFixture.Accepted)));
+            h.On("GET " + KisFixture.Ccld, KisStub.Json(HttpStatusCode.OK, KisFixture.Rows(KisFixture.Row("0000117057", "4", "70000", "6"))));
+            var order = new QuantConnect.Orders.LimitOrder(Samsung, 10, 72100m, DateTime.UtcNow, Tag);
+            b.PlaceOrder(order);
+            b.Poll(KisFixture.Now.AddSeconds(31));  // LEAN has no order for the id yet: the increment must not be consumed
+            Assert.Single(events);
+            byId["20261015:91252:0000117057"] = new List<QuantConnect.Orders.Order> { order };
+            b.Poll(KisFixture.Now.AddSeconds(62));
+            var fill = Assert.Single(events.Skip(1));
+            Assert.Equal((QuantConnect.Orders.OrderStatus.PartiallyFilled, 4m, 70000m), (fill.Status, fill.FillQuantity, fill.FillPrice));
+        }
+
+        [Fact]
         public void Feed_down_after_three_minutes_without_socket_or_rest()
         {
             var (_, _, dir, _) = KisFixture.Rest();
