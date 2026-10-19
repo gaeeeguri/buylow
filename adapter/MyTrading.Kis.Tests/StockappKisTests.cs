@@ -9,6 +9,8 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
 using MyTrading.Kis;
 using MyTrading.Stockapp;
 using Newtonsoft.Json.Linq;
@@ -230,6 +232,63 @@ namespace MyTrading.Kis.Tests
                 KisFixture.Ok("{\"stck_prpr\":\"70000\",\"stck_mxpr\":\"91000\",\"stck_llam\":\"49000\"}")));
             Assert.Equal((49000m, 91000m), rest.PriceLimits("005930"));
             Assert.Equal(70000m, rest.LastPrice("005930"));
+        }
+    }
+
+    public class KisSocketTests
+    {
+        private static string Encrypt(string plain, string key, string iv)
+        {
+            using var aes = Aes.Create();
+            aes.Mode = CipherMode.CBC;
+            aes.Padding = PaddingMode.PKCS7;
+            aes.Key = Encoding.UTF8.GetBytes(key);
+            aes.IV = Encoding.UTF8.GetBytes(iv);
+            using var enc = aes.CreateEncryptor();
+            var bytes = Encoding.UTF8.GetBytes(plain);
+            return Convert.ToBase64String(enc.TransformFinalBlock(bytes, 0, bytes.Length));
+        }
+
+        [Fact]
+        public void Subscribe_frame()
+        {
+            Assert.Equal("{\"header\":{\"approval_key\":\"A1\",\"custtype\":\"P\",\"tr_type\":\"1\",\"content-type\":\"utf-8\"}," +
+                         "\"body\":{\"input\":{\"tr_id\":\"H0STCNI9\",\"tr_key\":\"myhts\"}}}",
+                KisSocket.Subscribe("A1", "H0STCNI9", "myhts", true));
+        }
+
+        [Fact]
+        public void Control_frames()
+        {
+            Assert.Equal(KisFrameKind.Ping, KisSocket.Parse("{\"header\":{\"tr_id\":\"PINGPONG\",\"datetime\":\"20261015091500\"}}", null, null).Kind);
+            var ack = KisSocket.Parse("{\"header\":{\"tr_id\":\"H0STCNI9\"},\"body\":{\"rt_cd\":\"0\",\"msg1\":\"SUBSCRIBE SUCCESS\"," +
+                                      "\"output\":{\"iv\":\"0123456789abcdef\",\"key\":\"0123456789abcdef0123456789abcdef\"}}}", null, null);
+            Assert.Equal((KisFrameKind.Ack, true, "0123456789abcdef0123456789abcdef", "0123456789abcdef"), (ack.Kind, ack.AckOk, ack.Key, ack.Iv));
+            var refused = KisSocket.Parse("{\"header\":{\"tr_id\":\"H0STCNI9\"},\"body\":{\"rt_cd\":\"1\",\"msg1\":\"invalid approval : NOT FOUND\"}}", null, null);
+            Assert.Equal((KisFrameKind.Ack, false), (refused.Kind, refused.AckOk));
+            Assert.Equal(KisFrameKind.Other, KisSocket.Parse("garbage", null, null).Kind);
+        }
+
+        [Fact]
+        public void An_encrypted_fill_notice_names_its_order_and_wakes_without_a_key()
+        {
+            const string key = "0123456789abcdef0123456789abcdef", iv = "0123456789abcdef";
+            var fields = Enumerable.Repeat("", 14).ToArray();
+            fields[2] = "0000117057"; fields[4] = "02"; fields[8] = "005930"; fields[9] = "4"; fields[10] = "70000"; fields[13] = "2";
+            var frame = "1|H0STCNI9|001|" + Encrypt(string.Join("^", fields), key, iv);
+            var f = KisSocket.Parse(frame, key, iv);
+            Assert.Equal((KisFrameKind.Fill, "0000117057", "005930"), (f.Kind, f.OrderNo, f.Symbol));
+            var blind = KisSocket.Parse(frame, null, null);
+            Assert.Equal((KisFrameKind.Fill, (string)null), (blind.Kind, blind.OrderNo));  // still a wake-up
+        }
+
+        [Fact]
+        public void A_trade_frame_is_a_tick()
+        {
+            var fields = Enumerable.Repeat("0", 13).ToArray();
+            fields[0] = "005930"; fields[1] = "091500"; fields[2] = "71500";
+            var t = KisSocket.Parse("0|H0STCNT0|001|" + string.Join("^", fields), null, null);
+            Assert.Equal((KisFrameKind.Trade, "005930", 71500m), (t.Kind, t.Symbol, t.Price));
         }
     }
 }

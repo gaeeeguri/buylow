@@ -25,18 +25,6 @@ using QuantConnect.Logging;
 
 namespace MyTrading.Kis
 {
-    /// <summary>체결통보 1건(내 주문의 체결).</summary>
-    public class KisFill
-    {
-        public string OrderNo;     // ODER_NO
-        public string Ticker;      // STCK_SHRN_ISCD
-        public bool Buy;           // SELN_BYOV_CLS: 02 매수 / 01 매도
-        public int FillQty;        // CNTG_QTY
-        public decimal FillPrice;  // CNTG_UNPR
-        public string FillTime;    // STCK_CNTG_HOUR (HHMMSS)
-        public bool IsFilled;      // CNTG_YN == "2"
-    }
-
     public class KisWebSocketClient : IDisposable
     {
         private readonly string _approvalKey;
