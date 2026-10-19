@@ -49,6 +49,12 @@ build_one() {
   fi
   cp "$out" "$LAUNCHER_OUT/"
   echo "   복사: $LAUNCHER_OUT/$dll"
+  # stockapp: both adapters reference MyTrading.Stockapp (the shared core); Composer needs it next to the launcher
+  local shared="$REPO_ROOT/adapter/$proj/bin/Release/net10.0/MyTrading.Stockapp.dll"
+  if [ -f "$shared" ]; then
+    cp "$shared" "$LAUNCHER_OUT/"
+    echo "   복사: $LAUNCHER_OUT/MyTrading.Stockapp.dll"
+  fi
 }
 
 for t in "${TARGETS[@]}"; do

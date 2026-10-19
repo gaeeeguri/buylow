@@ -10,6 +10,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using MyTrading.Stockapp;
 using MyTrading.Toss;
 using Newtonsoft.Json.Linq;
 using QuantConnect;

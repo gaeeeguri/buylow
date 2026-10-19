@@ -13,16 +13,14 @@
 
 using System;
 using System.Globalization;
-using System.Text.RegularExpressions;
+using MyTrading.Stockapp;
 using Newtonsoft.Json.Linq;
 
 namespace MyTrading.Toss
 {
     public static class OrderPolicy
     {
-        private static readonly Regex ClientOrderId = new Regex("^[0-9a-z]{6}-[0-9a-z]{6}-[0-9a-z]{3}-[0-9a-z]{2}$");
-
-        public static bool IsClientOrderId(string tag) => tag != null && ClientOrderId.IsMatch(tag);
+        public static bool IsClientOrderId(string tag) => Guardrails.IsClientOrderId(tag);
 
         public static string FormatPrice(string market, decimal price)
         {
@@ -46,22 +44,9 @@ namespace MyTrading.Toss
 
         /// <summary>The first stateless guardrail the order breaks, or null.</summary>
         public static string Check(TossSettings s, string tag, string market, decimal qty, decimal limit,
-                                   (decimal lower, decimal upper)? priceLimits)
-        {
-            if (!s.TradingEnabled) return "trading is disabled for this run (alert-only)";
-            if (!IsClientOrderId(tag)) return "the order carries no stockapp client order id";
-            if (qty <= 0 || limit <= 0) return "quantity and limit price must be positive";
-            // Fail closed: a missing cap or unknown KR limits refuse the order rather than skip the check.
-            var max = market == "KR" ? s.MaxOrderKrw : s.MaxOrderUsd;
-            if (max <= 0) return $"no max order amount is set for {market} (toss-max-order-{(market == "KR" ? "krw" : "usd")})";
-            var amount = qty * limit;
-            if (amount > max)
-                return $"max order amount: {amount.ToString(CultureInfo.InvariantCulture)} > {max.ToString(CultureInfo.InvariantCulture)}";
-            if (market == "KR" && !priceLimits.HasValue) return "today's price limits are unknown (Toss /price-limits gave none)";
-            if (priceLimits.HasValue && (limit < priceLimits.Value.lower || limit > priceLimits.Value.upper))
-                return $"price {limit.ToString(CultureInfo.InvariantCulture)} is outside today's limits " +
-                       $"{priceLimits.Value.lower.ToString(CultureInfo.InvariantCulture)}–{priceLimits.Value.upper.ToString(CultureInfo.InvariantCulture)}";
-            return null;
-        }
+                                   (decimal lower, decimal upper)? priceLimits) =>
+            Guardrails.Check(s.TradingEnabled, market == "KR" ? s.MaxOrderKrw : s.MaxOrderUsd,
+                             $"toss-max-order-{(market == "KR" ? "krw" : "usd")}", tag, market, qty, limit,
+                             priceLimits, "Toss /price-limits");
     }
 }

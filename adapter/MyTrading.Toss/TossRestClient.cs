@@ -17,6 +17,7 @@ using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
+using MyTrading.Stockapp;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using QuantConnect.Logging;

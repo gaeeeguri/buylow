@@ -9,7 +9,7 @@ using System;
 using System.IO;
 using Newtonsoft.Json.Linq;
 
-namespace MyTrading.Toss
+namespace MyTrading.Stockapp
 {
     public class TokenFileProvider
     {
@@ -28,10 +28,10 @@ namespace MyTrading.Toss
                 if (_token == null || stamp != _stamp)
                 {
                     if (stamp == DateTime.MinValue)
-                        throw new TossException("stockapp token file is missing: the backend isn't running");
+                        throw new StockappException("stockapp token file is missing: the backend isn't running");
                     var token = JObject.Parse(File.ReadAllText(_path)).Value<string>("access_token");
                     if (string.IsNullOrEmpty(token))
-                        throw new TossException("stockapp token file has no access_token");
+                        throw new StockappException("stockapp token file has no access_token");
                     _token = token;
                     _stamp = stamp;
                 }

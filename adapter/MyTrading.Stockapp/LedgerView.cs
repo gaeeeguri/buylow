@@ -12,7 +12,7 @@ using System.Collections.Generic;
 using System.IO;
 using Newtonsoft.Json.Linq;
 
-namespace MyTrading.Toss
+namespace MyTrading.Stockapp
 {
     public class LedgerOrder
     {

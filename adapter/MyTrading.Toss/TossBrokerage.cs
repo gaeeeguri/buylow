@@ -26,6 +26,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Threading;
+using MyTrading.Stockapp;
 using Newtonsoft.Json.Linq;
 using NodaTime;
 using QuantConnect;

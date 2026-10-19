@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    stockapp: the broker-neutral core both live adapters share (stockapp KIS spec §5.1): the backend's token
+    file, the ledger view LEAN starts from, cumulative order state as fill increments, and the stateless
+    guardrails. net10 lineage 2.5.17757 like the adapters (never 10730.x; docs/DEVELOPMENT.md).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>MyTrading.Stockapp</AssemblyName>
+    <RootNamespace>MyTrading.Stockapp</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <NuGetAudit>false</NuGetAudit>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Newtonsoft.Json comes with it, as in the adapters -->
+    <PackageReference Include="QuantConnect.Common" Version="2.5.17757" />
+  </ItemGroup>
+
+</Project>
