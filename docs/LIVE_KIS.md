@@ -1,5 +1,11 @@
 # Live trading via KIS (한국투자증권) — LEAN brokerage adapter
 
+> **stockapp fork (`stock-app` branch):** this adapter runs only in stockapp mode. The backend issues the
+> token and approval key and passes the app key and secret in a 0600 secrets file. Orders are LIMIT,
+> KRX-pinned, and sent once (no retry of an uncertain send). Fills come from inquire-daily-ccld, and holdings
+> and cash from the strategy ledger. Shared logic lives in `adapter/MyTrading.Stockapp`. The upstream sections
+> below describe buylow's own mode, which this branch no longer builds.
+
 > ⚠️ **Real-money path.** This document describes the live-trading engine: a C# `IBrokerage` +
 > `IDataQueueHandler` adapter (`adapter/MyTrading.Kis`) that lets the **same strategy `.py`** run
 > live through LEAN, placing real orders on KIS. The arming switch has been **removed**: when the

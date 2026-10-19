@@ -304,4 +304,142 @@ namespace MyTrading.Kis.Tests
             Assert.Equal((KisFrameKind.Trade, "005930", 71500m), (t.Kind, t.Symbol, t.Price));
         }
     }
+
+    public class NoAggregator : QuantConnect.Data.IDataAggregator
+    {
+        public IEnumerator<QuantConnect.Data.BaseData> Add(QuantConnect.Data.SubscriptionDataConfig c, EventHandler h) => null;
+        public bool Remove(QuantConnect.Data.SubscriptionDataConfig c) => true;
+        public void Update(QuantConnect.Data.BaseData input) { }
+        public void Initialize(QuantConnect.Data.DataAggregatorInitializeParameters p) { }
+        public void Dispose() { }
+    }
+
+    public class KisBrokerageTests
+    {
+        private const string View = "{\"cash\":{\"KRW\":1000000,\"USD\":0},\"positions\":[" +
+            "{\"symbol\":\"005930\",\"market\":\"KR\",\"qty\":3,\"avg_cost\":70000}]," +
+            "\"open_orders\":[{\"client_order_id\":\"000007-0000ya-001-01\",\"order_id\":\"20261015:91252:0000117050\"," +
+            "\"symbol\":\"005930\",\"market\":\"KR\",\"side\":\"BUY\",\"qty\":5,\"filled_qty\":1,\"avg_fill_price\":70000,\"limit_price\":72100}]}";
+        private const string Tag = "000007-0000ya-002-01";
+        private static readonly QuantConnect.Symbol Samsung = new KisSymbolMapper().GetLeanSymbol("005930", QuantConnect.SecurityType.Equity, "krx");
+
+        private static (KisBrokerage b, KisStub h, List<QuantConnect.Orders.OrderEvent> events,
+                        List<QuantConnect.Brokerages.BrokerageMessageEvent> messages, Dictionary<string, List<QuantConnect.Orders.Order>> byId)
+            Make(bool trading = true, Func<DateTime> now = null, KisSocket socket = null)
+        {
+            var (rest, h, dir, _) = KisFixture.Rest(trading, now);
+            File.WriteAllText(Path.Combine(dir, "ledger-view.json"), View);
+            var byId = new Dictionary<string, List<QuantConnect.Orders.Order>>();
+            var b = new KisBrokerage(null, KisFixture.Settings(dir, trading), rest, new NoAggregator(),
+                                     id => byId.TryGetValue(id, out var l) ? l : new List<QuantConnect.Orders.Order>(), now ?? (() => KisFixture.Now), socket);
+            var events = new List<QuantConnect.Orders.OrderEvent>();
+            var messages = new List<QuantConnect.Brokerages.BrokerageMessageEvent>();
+            b.OrdersStatusChanged += (_, list) => events.AddRange(list);
+            b.Message += (_, m) => messages.Add(m);
+            return (b, h, events, messages, byId);
+        }
+
+        private static void Quote(KisStub h) => h.On("GET " + KisFixture.Price, KisStub.Json(HttpStatusCode.OK,
+            KisFixture.Ok("{\"stck_prpr\":\"70000\",\"stck_mxpr\":\"91000\",\"stck_llam\":\"49000\"}")));
+
+        [Fact]
+        public void Reports_the_ledger_not_the_account()
+        {
+            var (b, _, _, _, _) = Make();
+            Assert.Equal(1000000m, b.GetCashBalance().Single(c => c.Currency == "KRW").Amount);
+            Assert.Equal("005930:krx:3", b.GetAccountHoldings().Select(x => $"{x.Symbol.Value}:{x.Symbol.ID.Market}:{x.Quantity}").Single());
+            var open = Assert.Single(b.GetOpenOrders());
+            Assert.Equal(("000007-0000ya-001-01", "20261015:91252:0000117050"), (open.Tag, open.BrokerId.Single()));
+            Assert.False(b.ShouldPerformCashSync(DateTime.UtcNow));
+        }
+
+        [Fact]
+        public void Refuses_non_limit_and_non_krx_before_any_request()
+        {
+            var (b, h, events, _, _) = Make();
+            Assert.False(b.PlaceOrder(new QuantConnect.Orders.MarketOrder(Samsung, 2, DateTime.UtcNow, Tag)));
+            var aapl = new QuantConnect.Symbol(QuantConnect.SecurityIdentifier.GenerateEquity("AAPL", QuantConnect.Market.USA, mapSymbol: false), "AAPL");
+            Assert.False(b.PlaceOrder(new QuantConnect.Orders.LimitOrder(aapl, 1, 190m, DateTime.UtcNow, Tag)));
+            Assert.Equal(new[] { "guardrail: only limit orders are sent", "guardrail: KIS trades KR (krx) equities only" },
+                         events.Select(e => e.Message));
+            Assert.All(events, e => Assert.Equal(QuantConnect.Orders.OrderStatus.Invalid, e.Status));
+            Assert.Empty(h.Seen);
+        }
+
+        [Fact]
+        public void Alert_only_refuses_before_any_request()
+        {
+            var (b, h, events, _, _) = Make(trading: false);
+            Assert.False(b.PlaceOrder(new QuantConnect.Orders.LimitOrder(Samsung, 2, 72100m, DateTime.UtcNow, Tag)));
+            Assert.StartsWith("guardrail: trading is disabled", Assert.Single(events).Message);
+            Assert.Empty(h.Seen);
+        }
+
+        [Fact]
+        public void An_accepted_order_is_tracked_and_a_rejected_one_is_invalid()
+        {
+            var (b, h, events, _, _) = Make();
+            Quote(h);
+            h.On("POST " + KisFixture.Cash, KisStub.Json(HttpStatusCode.OK, KisFixture.Ok(KisFixture.Accepted)),
+                 KisStub.Json(HttpStatusCode.OK, KisFixture.Refuse("APBK0952")));
+            var ok = new QuantConnect.Orders.LimitOrder(Samsung, 2, 72100m, DateTime.UtcNow, Tag);
+            Assert.True(b.PlaceOrder(ok));
+            Assert.Equal("20261015:91252:0000117057", ok.BrokerId.Single());
+            Assert.Equal(QuantConnect.Orders.OrderStatus.Submitted, events[0].Status);
+            Assert.Equal("ACCEPTED", JObject.Parse(events[0].Message.Substring(4)).Value<string>("status"));
+            var bad = new QuantConnect.Orders.LimitOrder(Samsung, 2, 72100m, DateTime.UtcNow, "000007-0000ya-003-01");
+            Assert.False(b.PlaceOrder(bad));
+            Assert.Equal(QuantConnect.Orders.OrderStatus.Invalid, events[1].Status);
+            Assert.Contains("APBK0952", events[1].Message);
+        }
+
+        [Fact]
+        public void An_uncertain_send_is_never_sent_again()
+        {
+            var (b, h, events, messages, _) = Make();
+            Quote(h);
+            h.On("POST " + KisFixture.Cash, () => null);  // the connection drops after the request left
+            h.On("GET " + KisFixture.Ccld, KisStub.Json(HttpStatusCode.OK, KisFixture.Rows()));
+            var order = new QuantConnect.Orders.LimitOrder(Samsung, 2, 72100m, DateTime.UtcNow, Tag);
+            Assert.True(b.PlaceOrder(order));
+            Assert.Empty(order.BrokerId);
+            Assert.Empty(events);
+            Assert.Equal(("kis-unknown", Tag), (messages.Single().Code, messages.Single().Message));
+            b.Poll(KisFixture.Now.AddMinutes(10));
+            b.Poll(KisFixture.Now.AddMinutes(20));
+            Assert.Equal(1, h.Seen.Count(s => s.key == "POST " + KisFixture.Cash));
+        }
+
+        [Fact]
+        public void Fills_come_from_the_daily_orders()
+        {
+            var (b, h, events, _, byId) = Make();
+            Quote(h);
+            h.On("POST " + KisFixture.Cash, KisStub.Json(HttpStatusCode.OK, KisFixture.Ok(KisFixture.Accepted)));
+            h.On("GET " + KisFixture.Ccld,
+                KisStub.Json(HttpStatusCode.OK, KisFixture.Rows(KisFixture.Row("0000117057", "4", "70000", "6"))),
+                KisStub.Json(HttpStatusCode.OK, KisFixture.Rows(KisFixture.Row("0000117057", "10", "70060", "0"),
+                                                                KisFixture.Row("0000117099", "0", "0", "0", orgn: "0000117057"))));
+            var order = new QuantConnect.Orders.LimitOrder(Samsung, 10, 72100m, DateTime.UtcNow, Tag);
+            byId["20261015:91252:0000117057"] = new List<QuantConnect.Orders.Order> { order };
+            b.PlaceOrder(order);
+            b.Poll(KisFixture.Now.AddSeconds(31));
+            b.Poll(KisFixture.Now.AddSeconds(62));
+            var fills = events.Skip(1).ToList();
+            Assert.Equal(new[] { (QuantConnect.Orders.OrderStatus.PartiallyFilled, 4m, 70000m), (QuantConnect.Orders.OrderStatus.Filled, 6m, 70100m) },
+                         fills.Select(e => (e.Status, e.FillQuantity, e.FillPrice)));
+            Assert.All(fills, e => Assert.StartsWith("kis:", e.Message));
+        }
+
+        [Fact]
+        public void Feed_down_after_three_minutes_without_socket_or_rest()
+        {
+            var (_, _, dir, _) = KisFixture.Rest();
+            var socket = new KisSocket(KisFixture.Settings(dir), () => "A1", () => { }, _ => { });  // never started: down
+            var (b, h, _, messages, _) = Make(now: () => DateTime.UtcNow, socket: socket);
+            h.On("GET " + KisFixture.Ccld, KisStub.Json(HttpStatusCode.InternalServerError, "{}"));
+            b.Poll(DateTime.UtcNow.AddMinutes(4));
+            Assert.Contains(messages, m => m.Code == "kis-feed-down");
+        }
+    }
 }

@@ -1,21 +1,26 @@
 /*
- * KisBrokerage — KIS 한국투자증권 LEAN 라이브 브로커리지 + 실시간 데이터큐.
+ * KisBrokerage — LEAN live brokerage + data queue for KIS (한국투자증권), stockapp mode (stockapp KIS spec §5).
  *
- * 역할: LEAN 라이브 엔진이 전략(①선별 + ②타이밍, 백테스트와 동일 코드)이 만든 주문을 이 클래스를 통해
- * KIS로 실제 전송하고, 체결통보/시세를 받아 LEAN에 되먹인다.
- *
- * ★ 무장(arming) 게이트는 제거됨: enabled면 실전(real)·모의(demo) 모두 주문을 바로 전송한다.
- *   유일한 선택적 방벽은 max_order_amount(원>0)로, 1건 주문금액이 한도를 넘으면 거부한다(0=비활성).
- *   (자세한 정책은 docs/LIVE_KIS.md.)
- *
- * 한 클래스가 IBrokerage와 IDataQueueHandler를 모두 구현 — KIS는 동일 토큰/세션 위에서 주문과 시세가
- * 함께 돌아가므로 묶는 게 자연스럽다(zerodha 등 LEAN 다른 어댑터와 동일 패턴).
+ * - Orders: only LIMIT orders on krx equities whose tag is a stockapp client order id (persisted in stockapp's
+ *   ledger before LEAN sees the order), after the shared stateless guardrails. Body: ORD_DVSN 00,
+ *   EXCG_ID_DVSN_CD KRX (the opening auction, never SOR/NXT). Sent once: an uncertain send is reported as
+ *   `kis-unknown` and never sent again, because KIS has no idempotency key and a resend could place a second
+ *   real order. stockapp's backend resolves it by field matching.
+ * - Fills: inquire-daily-ccld is the truth. Tracked orders are re-read every 30 s, every 5 s while the socket is
+ *   down, and when a fill notice arrives. Cumulative state becomes fill increments (CumulativeFills); each event
+ *   carries "kis:{...}" for the ledger.
+ * - Holdings, cash and open orders come from the strategy ledger (LedgerView); LEAN's cash sync is off.
+ * - Market data: H0STCNT0 ticks, inquire-price every 15 s while the socket is down, and a USDKRW quote once a
+ *   minute (the algorithm subscribes it).
+ * - Brokerage messages: `kis-unknown` (message: the client order id), `kis-auth`, `kis-feed-down`.
  */
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using MyTrading.Stockapp;
+using NodaTime;
 using QuantConnect;
 using QuantConnect.Brokerages;
 using QuantConnect.Configuration;
@@ -35,292 +40,307 @@ namespace MyTrading.Kis
     {
         static KisBrokerage()
         {
-            // C# 런타임에도 krx 시장을 등록(시장코드↔id). market/krx.py(백테스트 데이터 주입)와 동일 id.
             try { Market.Add(KisConstants.KrxMarket, KisConstants.KrxMarketId); }
-            catch { /* 이미 등록됨 */ }
+            catch { /* already registered */ }
         }
 
         private readonly IAlgorithm _algorithm;
-        private readonly KisRestClient _rest;
-        private readonly KisSymbolMapper _symbolMapper = new KisSymbolMapper();
+        private readonly KisSettings _settings;
+        private readonly KisRest _rest;
+        private readonly KisSecrets _secrets;
+        private readonly KisSymbolMapper _mapper = new KisSymbolMapper();
         private readonly IDataAggregator _aggregator;
-        private readonly string _cano;
-        private readonly string _acntPrdtCd;
-        private readonly string _env;
-        private readonly string _htsId;
-        private readonly decimal _maxOrderAmount;
+        private readonly Func<string, List<Order>> _ordersByBrokerId;
+        private readonly Func<DateTime> _utcNow;
+        private readonly CumulativeFills _fills = new CumulativeFills();
+        private readonly HashSet<Symbol> _subscribed = new HashSet<Symbol>();
+        private readonly object _subLock = new object(), _refreshLock = new object();
+        private KisSocket _socket;
+        private CancellationTokenSource _cts;
+        private Thread _poller;
+        private bool _connected, _feedDownReported, _authReported;
+        private DateTime _lastOrderPoll = DateTime.MinValue, _lastPricePoll = DateTime.MinValue, _lastFx = DateTime.MinValue;
+        private DateTime _restOkAt;
 
-        private KisWebSocketClient _ws;
-        private bool _connected;
-        // 부분체결 누적 추적(brokerId=ODNO → 체결수량 합). 풀필/부분 판정용.
-        private readonly ConcurrentDictionary<string, int> _filledQty = new ConcurrentDictionary<string, int>();
-
-        // 연결 판정은 주문 경로(REST) 기준. WS는 실시간 시세/체결통보용으로 Connect()에서 비동기로
-        // 열리며(연결까지 수십~수백 ms) 실패해도 경고만 낸다(주문/잔고는 REST라 가능). LEAN의
-        // BrokerageSetupHandler는 Connect() 직후 IsConnected를 검사하는데, 여기에 _ws.IsConnected를
-        // 묶으면 WS가 아직 안 열려 false → "Unable to connect to brokerage"로 라이브 초기화가 죽는다.
-        // REST 토큰 발급 성공(=_connected)만으로 판정한다.
         public override bool IsConnected => _connected;
 
-        public KisBrokerage(IAlgorithm algorithm, string appKey, string appSecret, string accountNo,
-                            string env, string htsId, decimal maxOrderAmount,
-                            string tokenCachePath)
+        public KisBrokerage(IAlgorithm algorithm, KisSettings settings, KisRest rest = null, IDataAggregator aggregator = null,
+                            Func<string, List<Order>> ordersByBrokerId = null, Func<DateTime> utcNow = null, KisSocket socket = null)
             : base("KisBrokerage")
         {
             _algorithm = algorithm;
-            _env = string.IsNullOrEmpty(env) ? "demo" : env;
-            _htsId = htsId;
-            _maxOrderAmount = maxOrderAmount;
+            _settings = settings;
+            _utcNow = utcNow ?? (() => DateTime.UtcNow);
+            _restOkAt = _utcNow();
             AccountBaseCurrency = KisConstants.KrwCurrency;
-
-            // 계좌번호 "12345678-01" → CANO=12345678, ACNT_PRDT_CD=01
-            var parts = (accountNo ?? "").Split('-');
-            _cano = parts.Length > 0 ? parts[0].Trim() : "";
-            _acntPrdtCd = parts.Length > 1 ? parts[1].Trim() : "01";
-
-            _rest = new KisRestClient(appKey, appSecret, _env, tokenCachePath);
-            _aggregator = Composer.Instance.GetExportedValueByTypeName<IDataAggregator>(
+            _secrets = new KisSecrets(settings.SecretsFile);
+            _rest = rest ?? new KisRest(settings, new TokenFileProvider(settings.TokenFile), _secrets,
+                                        KisRest.CreateHttp(settings.Proxy, TimeSpan.FromSeconds(15)), null, _utcNow);
+            _ordersByBrokerId = ordersByBrokerId ?? (id => _algorithm.Transactions.GetOrdersByBrokerageId(id));
+            _socket = socket;
+            _aggregator = aggregator ?? Composer.Instance.GetExportedValueByTypeName<IDataAggregator>(
                 Config.Get("data-aggregator", "QuantConnect.Lean.Engine.DataFeeds.AggregationManager"));
         }
 
-        // ── 연결 ───────────────────────────────────────────────────────────
+        // ── connection ───────────────────────────────────────────────────
         public override void Connect()
         {
             if (_connected) return;
-            _rest.AccessToken();  // 토큰 선발급(실패 시 즉시 예외)
-            try
-            {
-                var approval = _rest.ApprovalKey();
-                _ws = new KisWebSocketClient(approval, _env, _htsId);
-                _ws.TradeReceived += OnTrade;
-                _ws.FillReceived += OnFill;
-                _ws.Connect();
-            }
-            catch (Exception e)
-            {
-                // 실시간 연결 실패해도 주문/잔고(REST)는 가능하므로 경고만 — 데이터피드는 빈 상태.
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "WsConnectFailed",
-                    $"KIS 실시간 연결 실패(주문/잔고는 정상): {e.Message}"));
-            }
+            var today = _rest.Today();
+            _rest.DailyOrders(today, today);  // fails fast if the token, the secrets or the tunnel is bad
+            _cts = new CancellationTokenSource();
+            _socket ??= new KisSocket(_settings, () => _secrets.ApprovalKey, _secrets.Invalidate, OnFrame);
+            UpdateSocket();
+            _socket.Start();
+            _poller = new Thread(PollLoop) { IsBackground = true, Name = "kis-poller" };
+            _poller.Start();
             _connected = true;
-            Log.Trace($"KisBrokerage.Connect(): env={_env} 계좌={_cano}-{_acntPrdtCd}");
+            Log.Trace("KisBrokerage.Connect(): connected (stockapp mode, " + _settings.Env + ", trading " +
+                      (_settings.TradingEnabled ? "enabled" : "disabled") + ")");
         }
 
         public override void Disconnect()
         {
-            _ws?.Dispose();
+            try { _cts?.Cancel(); } catch { }
+            _socket?.Stop();
             _connected = false;
         }
 
-        // ── 주문 ───────────────────────────────────────────────────────────
+        public override bool ShouldPerformCashSync(DateTime currentTimeUtc) => false;
+
+        // ── orders ───────────────────────────────────────────────────────
+        private void Report(Order order, OrderStatus status, string message, decimal fillQty = 0m, decimal fillPrice = 0m)
+        {
+            OnOrderEvent(new OrderEvent(order, _utcNow(), OrderFee.Zero, message)
+            {
+                Status = status,
+                FillQuantity = order.Direction == OrderDirection.Buy ? fillQty : -fillQty,
+                FillPrice = fillPrice,
+                FillPriceCurrency = KisConstants.KrwCurrency,
+            });
+        }
+
         public override bool PlaceOrder(Order order)
         {
-            var ticker = _symbolMapper.GetBrokerageSymbol(order.Symbol);
-            var buy = order.Direction == OrderDirection.Buy;
-            var isMarket = order.Type == OrderType.Market
-                           || order.Type == OrderType.MarketOnOpen || order.Type == OrderType.MarketOnClose;
-            var price = order.Type == OrderType.Limit && order is LimitOrder lo ? lo.LimitPrice
-                        : (order.Price != 0 ? order.Price : _algorithm.Securities[order.Symbol].Price);
-
-            // ── 주문금액 한도 검사 (선택적 안전장치, 한도 0이면 무조건 통과) ──
-            if (!LimitCheck(order, price, out var reject))
+            string refusal = null;
+            if (order.Type != OrderType.Limit) refusal = "only limit orders are sent";
+            else if (order.Symbol.SecurityType != SecurityType.Equity || order.Symbol.ID.Market != KisConstants.KrxMarket)
+                refusal = "KIS trades KR (krx) equities only";
+            var limit = order is LimitOrder lo ? lo.LimitPrice : 0m;
+            string pdno = null;
+            (decimal, decimal)? limits = null;
+            if (refusal == null)
             {
-                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, reject) { Status = OrderStatus.Invalid });
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "OrderBlocked", reject));
-                return false;
-            }
-
-            try
-            {
-                var ordDvsn = isMarket ? KisConstants.OrdDvsnMarket : KisConstants.OrdDvsnLimit;
-                var res = _rest.OrderCash(_cano, _acntPrdtCd, ticker, buy, (int)order.AbsoluteQuantity, price, ordDvsn);
-                if (!res.Ok || string.IsNullOrEmpty(res.OrderNo))
+                pdno = _mapper.GetBrokerageSymbol(order.Symbol);
+                if (_settings.TradingEnabled)
                 {
-                    var msg = $"KIS 주문거부 {res.Code} {res.Message}";
-                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, msg) { Status = OrderStatus.Invalid });
-                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "OrderRejected", msg));
-                    return false;
-                }
-                // ODNO를 brokerId로 — 체결통보가 이 번호로 들어온다.
-                order.BrokerId.Add(res.OrderNo);
-                if (!string.IsNullOrEmpty(res.OrgNo)) order.BrokerId.Add("ORG:" + res.OrgNo);
-                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero) { Status = OrderStatus.Submitted });
-                Log.Trace($"KisBrokerage.PlaceOrder(): {(buy ? "매수" : "매도")} {ticker} x{order.AbsoluteQuantity} ODNO={res.OrderNo}");
-                return true;
-            }
-            catch (Exception e)
-            {
-                // ★ Warning(Error 아님): 주문 1건의 예외가 LEAN RuntimeError로 라이브 전체를 종료시키면 안 된다.
-                // 해당 주문만 Invalid 처리하고 알고리즘은 계속(KisRestClient.SendOrder가 이미 전송오류를
-                // 예외 대신 결과로 돌려주므로 여기 도달은 드물지만, 방어적으로 치명화하지 않는다).
-                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, e.Message) { Status = OrderStatus.Invalid });
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "OrderError", e.Message));
-                return false;
-            }
-        }
-
-        /// <summary>주문금액 한도 검사. 통과 시 true. 한도(>0) 초과 시에만 거부(0=비활성). 무장 개념 없음.</summary>
-        private bool LimitCheck(Order order, decimal price, out string reason)
-        {
-            if (_maxOrderAmount > 0)
-            {
-                var amount = order.AbsoluteQuantity * (price > 0 ? price : 0m);
-                if (amount > _maxOrderAmount)
-                {
-                    reason = $"주문금액 {amount:N0}원 > 한도 {_maxOrderAmount:N0}원 — 차단.";
-                    return false;
+                    try { limits = _rest.PriceLimits(pdno); }
+                    catch (Exception e) { refusal = "couldn't read today's price limits: " + e.GetType().Name; }
                 }
             }
-            reason = null;
-            return true;
-        }
-
-        public override bool UpdateOrder(Order order)
-        {
-            var (orgNo, orderNo) = ExtractBrokerIds(order);
-            if (string.IsNullOrEmpty(orderNo)) return false;
-            try
+            refusal ??= Guardrails.Check(_settings.TradingEnabled, _settings.MaxOrderKrw, "kis-max-order-krw", order.Tag, "KR",
+                                         order.AbsoluteQuantity, limit, limits, "KIS inquire-price");
+            if (refusal != null)
             {
-                var price = order is LimitOrder lo ? lo.LimitPrice : order.Price;
-                var res = _rest.ReviseCancel(_cano, _acntPrdtCd, orgNo, orderNo, false, (int)order.AbsoluteQuantity, price, false);
-                if (res.Ok)
-                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero) { Status = OrderStatus.UpdateSubmitted });
-                return res.Ok;
-            }
-            catch (Exception e)
-            {
-                // 정정 실패는 그 주문만의 문제 — 라이브 세션을 죽이지 않도록 Warning.
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "UpdateError", e.Message));
+                Report(order, OrderStatus.Invalid, "guardrail: " + refusal);
                 return false;
             }
+            var result = _rest.SendOrder(order.Direction == OrderDirection.Buy, pdno, order.AbsoluteQuantity, limit);
+            switch (result.Kind)
+            {
+                case SendKind.Accepted:
+                    order.BrokerId.Add(result.OrderId);
+                    _fills.Track(result.OrderId);
+                    Report(order, OrderStatus.Submitted, KisOrderRow.Describe("ACCEPTED", result.OrderId, 0m, 0m));
+                    return true;
+                case SendKind.Rejected:
+                    Report(order, OrderStatus.Invalid, KisOrderRow.Describe("REJECTED", null, 0m, 0m, result.Code, result.Message));
+                    return false;
+                default:
+                    // Never sent again (stockapp KIS spec §5.4): stockapp matches it against the daily orders.
+                    Log.Trace($"KisBrokerage: send of {order.Tag} uncertain ({result.Code}); left to stockapp's field matching");
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "kis-unknown", order.Tag));
+                    return true;
+            }
         }
+
+        public override bool UpdateOrder(Order order) => false;  // stockapp v1 never modifies
 
         public override bool CancelOrder(Order order)
         {
-            var (orgNo, orderNo) = ExtractBrokerIds(order);
-            if (string.IsNullOrEmpty(orderNo)) return false;
-            try
-            {
-                var res = _rest.ReviseCancel(_cano, _acntPrdtCd, orgNo, orderNo, true, (int)order.AbsoluteQuantity, 0m, true);
-                if (res.Ok)
-                    OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero) { Status = OrderStatus.Canceled });
-                return res.Ok;
-            }
-            catch (Exception e)
-            {
-                // 취소 실패는 그 주문만의 문제 — 라이브 세션을 죽이지 않도록 Warning.
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "CancelError", e.Message));
-                return false;
-            }
+            var orderId = order.BrokerId.FirstOrDefault();
+            if (string.IsNullOrEmpty(orderId)) return false;
+            var ok = _rest.Cancel(orderId);
+            Refresh();  // the terminal state comes from the daily orders, never from the cancel answer
+            return ok;
         }
 
-        private static (string orgNo, string orderNo) ExtractBrokerIds(Order order)
+        // ── ledger-backed account (stockapp spec §7.2) ────────────────────
+        private LedgerView View() => LedgerView.Load(_settings.LedgerView);
+        private Symbol Lean(string code) => _mapper.GetLeanSymbol(code, SecurityType.Equity, KisConstants.KrxMarket);
+
+        public override List<CashAmount> GetCashBalance() => View().Cash.Select(c => new CashAmount(c.Value, c.Key)).ToList();
+
+        public override List<Holding> GetAccountHoldings() => View().Positions.Select(p => new Holding
         {
-            string orgNo = null, orderNo = null;
-            foreach (var id in order.BrokerId)
-            {
-                if (id.StartsWith("ORG:", StringComparison.Ordinal)) orgNo = id.Substring(4);
-                else orderNo = id;
-            }
-            return (orgNo, orderNo);
-        }
+            Symbol = Lean(p.symbol), Quantity = p.qty, AveragePrice = p.avgCost, MarketPrice = p.avgCost, CurrencySymbol = "₩",
+        }).ToList();
 
-        // ── 잔고/예수금/주문 ──────────────────────────────────────────────
         public override List<Order> GetOpenOrders()
         {
-            // 라이브 시작 시 기존 미체결 동기화는 미구현(첫 cut). 새 세션은 빈 상태로 시작한다.
-            return new List<Order>();
-        }
-
-        public override List<Holding> GetAccountHoldings()
-        {
-            var balance = _rest.InquireBalance(_cano, _acntPrdtCd);
-            return balance.Holdings.Select(h => new Holding
+            var orders = new List<Order>();
+            foreach (var o in View().OpenOrders)
             {
-                Symbol = _symbolMapper.GetLeanSymbol(h.Ticker, SecurityType.Equity, KisConstants.KrxMarket),
-                Quantity = h.Quantity,
-                AveragePrice = h.AveragePrice,
-                MarketPrice = h.CurrentPrice,
-                MarketValue = h.EvalAmount,
-                UnrealizedPnL = h.ProfitLoss,
-                CurrencySymbol = "₩",
-            }).ToList();
-        }
-
-        public override List<CashAmount> GetCashBalance()
-        {
-            var balance = _rest.InquireBalance(_cano, _acntPrdtCd);
-            // D+2 예수금(결제반영)을 가용현금으로. 없으면 총예수금.
-            var cash = balance.D2Deposit > 0 ? balance.D2Deposit : balance.Deposit;
-            return new List<CashAmount> { new CashAmount(cash, KisConstants.KrwCurrency) };
-        }
-
-        // ── 체결통보 → OrderEvent ─────────────────────────────────────────
-        private void OnFill(KisFill fill)
-        {
-            if (!fill.IsFilled || fill.FillQty <= 0) return;
-            var orders = _algorithm.Transactions.GetOrdersByBrokerageId(fill.OrderNo);
-            if (orders == null || orders.Count == 0)
-            {
-                Log.Trace($"KisBrokerage.OnFill(): 매칭 주문 없음 ODNO={fill.OrderNo}");
-                return;
+                var order = new LimitOrder(Lean(o.Symbol), o.Buy ? o.Qty : -o.Qty, o.LimitPrice, _utcNow(), o.ClientOrderId);
+                order.BrokerId.Add(o.OrderId);
+                _fills.Track(o.OrderId, o.FilledQty, o.AvgFillPrice);
+                orders.Add(order);
             }
-            foreach (var order in orders)
+            return orders;
+        }
+
+        // ── fills, prices ────────────────────────────────────────────────
+        private void OnFrame(KisFrame f)
+        {
+            try
             {
-                var cumulative = _filledQty.AddOrUpdate(fill.OrderNo, fill.FillQty, (_, prev) => prev + fill.FillQty);
-                var status = cumulative >= order.AbsoluteQuantity ? OrderStatus.Filled : OrderStatus.PartiallyFilled;
-                var signed = fill.Buy ? fill.FillQty : -fill.FillQty;
-                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero)
+                if (f.Kind == KisFrameKind.Fill) Refresh();
+                else if (f.Kind == KisFrameKind.Trade) Tick(Lean(f.Symbol), f.Price, quote: false);
+            }
+            catch (Exception e) { Log.Trace($"KisBrokerage.OnFrame: {e.Message}"); }
+        }
+
+        private void Refresh()
+        {
+            lock (_refreshLock)
+            {
+                var ids = _fills.Tracked();
+                if (ids.Length == 0) return;
+                var today = _rest.Today();
+                var first = ids.Select(id => KisOrderId.TryParse(id, out var day, out _, out _) ? day : today)
+                               .OrderBy(d => d, StringComparer.Ordinal).First();
+                List<KisOrderRow> rows;
+                try { rows = _rest.DailyOrders(first, today); }
+                catch (Exception e) { Log.Trace($"KisBrokerage.Refresh: {e.Message}"); return; }
+                _restOkAt = _utcNow();
+                foreach (var id in ids)
                 {
-                    Status = status,
-                    FillQuantity = signed,
-                    FillPrice = fill.FillPrice,
-                    FillPriceCurrency = KisConstants.KrwCurrency,
-                });
-                if (status == OrderStatus.Filled) _filledQty.TryRemove(fill.OrderNo, out _);
+                    var row = rows.FirstOrDefault(r => !r.Revision && r.OrderId == id);
+                    if (row == null) continue;
+                    var step = _fills.Observe(row.Snapshot(today));
+                    if (step == null) continue;
+                    var status = step.Status switch
+                    {
+                        TrackedStatus.Filled => OrderStatus.Filled,
+                        TrackedStatus.Partial => OrderStatus.PartiallyFilled,
+                        TrackedStatus.Rejected => OrderStatus.Invalid,
+                        TrackedStatus.Canceled => OrderStatus.Canceled,
+                        _ => OrderStatus.Submitted,
+                    };
+                    foreach (var order in _ordersByBrokerId(id) ?? new List<Order>())
+                        Report(order, status, step.Message, step.FillQty, step.FillPrice);
+                }
             }
         }
 
-        // ── 실시간 시세 → 데이터피드 ──────────────────────────────────────
-        private void OnTrade(string ticker, decimal price, decimal volume, string hhmmss)
+        private void Tick(Symbol symbol, decimal price, bool quote)
         {
-            var symbol = _symbolMapper.GetLeanSymbol(ticker, SecurityType.Equity, KisConstants.KrxMarket);
-            // KRX는 Asia/Seoul. 라이브 틱 시각은 거래소 타임존으로(UTC+9 근사).
-            var time = DateTime.UtcNow.AddHours(9);
-            var tick = new Tick(time, symbol, "", "KRX", volume, price) { TickType = TickType.Trade };
-            _aggregator.Update(tick);
+            lock (_subLock) { if (!_subscribed.Contains(symbol)) return; }
+            var tz = _algorithm != null && _algorithm.Securities.ContainsKey(symbol) ? _algorithm.Securities[symbol].Exchange.TimeZone : DateTimeZone.Utc;
+            var now = _utcNow().ConvertFromUtc(tz);
+            _aggregator.Update(quote ? new Tick(now, symbol, price, price) { TickType = TickType.Quote }
+                                     : new Tick(now, symbol, "", "", 0m, price) { TickType = TickType.Trade });
         }
 
-        // ── IDataQueueHandler ──────────────────────────────────────────────
-        public IEnumerator<BaseData> Subscribe(SubscriptionDataConfig dataConfig, EventHandler newDataAvailableHandler)
+        private void PollLoop()
         {
-            if (!CanSubscribe(dataConfig.Symbol) || dataConfig.TickType == TickType.OpenInterest)
-                return null;
-            var enumerator = _aggregator.Add(dataConfig, newDataAvailableHandler);
-            _ws?.SubscribePrice(_symbolMapper.GetBrokerageSymbol(dataConfig.Symbol));
+            var token = _cts.Token;
+            while (!token.IsCancellationRequested)
+            {
+                try { Poll(_utcNow()); }
+                catch (Exception e) { Log.Trace($"KisBrokerage poller: {e.GetType().Name}: {e.Message}"); }
+                token.WaitHandle.WaitOne(TimeSpan.FromSeconds(1));
+            }
+        }
+
+        /// <summary>One poller step (public for tests). It never sends an order.</summary>
+        public void Poll(DateTime now)
+        {
+            var socketUp = _socket?.Connected == true;
+            if (now - _lastOrderPoll >= TimeSpan.FromSeconds(socketUp ? 30 : 5)) { _lastOrderPoll = now; Refresh(); }
+            if (!socketUp && now - _lastPricePoll >= TimeSpan.FromSeconds(15)) { _lastPricePoll = now; PollPrices(); }
+            if (_settings.UsdKrw > 0 && now - _lastFx >= TimeSpan.FromMinutes(1))
+            {
+                _lastFx = now;
+                Tick(Symbol.Create("USDKRW", SecurityType.Forex, Market.Oanda), _settings.UsdKrw, quote: true);
+            }
+            var down = _socket?.DownSince;
+            if (down.HasValue && now - down.Value > _settings.FeedDownAfter && now - _restOkAt > _settings.FeedDownAfter)
+            {
+                if (!_feedDownReported)
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "kis-feed-down",
+                        "WebSocket and REST both down for more than " + _settings.FeedDownAfter.TotalMinutes + " minutes"));
+                _feedDownReported = true;
+            }
+            else if (!down.HasValue) _feedDownReported = false;
+            if ((_rest.AuthFailures >= 3 || (_socket?.AuthFailures ?? 0) >= 3) && !_authReported)
+            {
+                _authReported = true;
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "kis-auth", "KIS refused the access token"));
+            }
+        }
+
+        private void PollPrices()
+        {
+            Symbol[] equities;
+            lock (_subLock) { equities = _subscribed.Where(s => s.SecurityType == SecurityType.Equity).ToArray(); }
+            foreach (var s in equities)
+            {
+                try
+                {
+                    var p = _rest.LastPrice(_mapper.GetBrokerageSymbol(s));
+                    if (p > 0) Tick(s, p, quote: false);
+                    _restOkAt = _utcNow();
+                }
+                catch (Exception e) { Log.Trace($"KisBrokerage.PollPrices {s.Value}: {e.Message}"); }
+            }
+        }
+
+        // ── IDataQueueHandler ────────────────────────────────────────────
+        private static bool CanSubscribe(Symbol s) =>
+            s != null && !s.Value.Contains("universe", StringComparison.OrdinalIgnoreCase) &&
+            ((s.SecurityType == SecurityType.Equity && s.ID.Market == KisConstants.KrxMarket) ||
+             (s.SecurityType == SecurityType.Forex && s.Value == "USDKRW"));
+
+        public IEnumerator<BaseData> Subscribe(SubscriptionDataConfig config, EventHandler newDataAvailableHandler)
+        {
+            if (!CanSubscribe(config.Symbol) || config.TickType == TickType.OpenInterest) return null;
+            var enumerator = _aggregator.Add(config, newDataAvailableHandler);
+            lock (_subLock) { _subscribed.Add(config.Symbol); }
+            UpdateSocket();
             return enumerator;
         }
 
-        public void Unsubscribe(SubscriptionDataConfig dataConfig)
+        public void Unsubscribe(SubscriptionDataConfig config)
         {
-            if (!CanSubscribe(dataConfig.Symbol)) return;
-            _ws?.UnsubscribePrice(_symbolMapper.GetBrokerageSymbol(dataConfig.Symbol));
-            _aggregator.Remove(dataConfig);
+            if (!CanSubscribe(config.Symbol)) return;
+            lock (_subLock) { _subscribed.Remove(config.Symbol); }
+            _aggregator.Remove(config);
+            UpdateSocket();
         }
 
-        public void SetJob(LiveNodePacket job) { /* 별도 처리 없음 — 생성자에서 모두 주입 */ }
-
-        private static bool CanSubscribe(Symbol symbol)
+        private void UpdateSocket()
         {
-            return symbol != null
-                && !symbol.Value.Contains("universe", StringComparison.OrdinalIgnoreCase)
-                && symbol.SecurityType == SecurityType.Equity
-                && symbol.ID.Market == KisConstants.KrxMarket;
+            string[] codes;
+            lock (_subLock) { codes = _subscribed.Where(s => s.SecurityType == SecurityType.Equity).Select(s => s.Value).ToArray(); }
+            _socket?.SetSymbols(codes);
         }
+
+        public void SetJob(LiveNodePacket job) { }
 
         public override void Dispose()
         {
-            _ws?.Dispose();
+            Disconnect();
             _aggregator?.Dispose();
         }
     }

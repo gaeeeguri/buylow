@@ -1,16 +1,12 @@
 /*
- * KisBrokerageFactory — LEAN Composer가 라이브 KIS 브로커리지를 생성하는 팩토리.
- *
- * config.json의 live-mode-brokerage="KisBrokerage"일 때 BrokerageSetupHandler가 이 팩토리를 찾아
- * BrokerageData(아래 키들, LeanRunner가 live config에 주입)로 KisBrokerage를 만든다.
- *
- * BrokerageData 키(=LeanRunner _build_live_config가 채움):
- *   kis-app-key / kis-app-secret / kis-account-no / kis-env(real|demo) /
- *   kis-hts-id(체결통보용, 선택) / kis-max-order-amount(원, 선택 한도) /
- *   kis-token-cache(토큰 디스크캐시 경로, 선택)
+ * KisBrokerageFactory — LEAN Composer's factory for the KIS live brokerage, stockapp mode only
+ * (stockapp KIS spec §5.2). stockapp's backend writes these keys into the live config (KisBroker.lean_brokerage).
+ * It never passes the app secret in the config: it is in the 0600 secrets file the config names.
  */
 
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
+using MyTrading.Stockapp;
 using QuantConnect.Brokerages;
 using QuantConnect.Configuration;
 using QuantConnect.Interfaces;
@@ -22,43 +18,40 @@ namespace MyTrading.Kis
 {
     public class KisBrokerageFactory : BrokerageFactory
     {
+        private static readonly string[] Keys =
+        {
+            "kis-env", "kis-token-file", "kis-secrets-file", "kis-ledger-view", "kis-account-no", "kis-hts-id",
+            "kis-trading-enabled", "kis-max-order-krw", "kis-usdkrw", "kis-proxy", "kis-base-url", "kis-ws-url",
+        };
+
         public KisBrokerageFactory() : base(typeof(KisBrokerage)) { }
 
-        public override Dictionary<string, string> BrokerageData => new Dictionary<string, string>
+        public override Dictionary<string, string> BrokerageData
         {
-            { "kis-app-key", Config.Get("kis-app-key") },
-            { "kis-app-secret", Config.Get("kis-app-secret") },
-            { "kis-account-no", Config.Get("kis-account-no") },
-            { "kis-env", Config.Get("kis-env", "demo") },
-            { "kis-hts-id", Config.Get("kis-hts-id") },
-            { "kis-max-order-amount", Config.Get("kis-max-order-amount", "0") },
-            { "kis-token-cache", Config.Get("kis-token-cache") },
-        };
+            get
+            {
+                var data = new Dictionary<string, string>();
+                foreach (var k in Keys) data[k] = Config.Get(k);
+                return data;
+            }
+        }
 
         public override IBrokerageModel GetBrokerageModel(IOrderProvider orderProvider) => new KisBrokerageModel();
 
         public override IBrokerage CreateBrokerage(LiveNodePacket job, IAlgorithm algorithm)
         {
-            var data = job.BrokerageData;
-            string Read(string k, string dflt = "") => data.TryGetValue(k, out var v) && !string.IsNullOrEmpty(v) ? v : dflt;
-
-            decimal.TryParse(Read("kis-max-order-amount", "0"), out var maxAmt);
-
-            var brokerage = new KisBrokerage(
-                algorithm,
-                Read("kis-app-key"),
-                Read("kis-app-secret"),
-                Read("kis-account-no"),
-                Read("kis-env", "demo"),
-                Read("kis-hts-id"),
-                maxAmt,
-                Read("kis-token-cache"));
-
-            // 라이브 데이터큐 핸들러로도 동일 인스턴스를 Composer에 등록(시세/주문 동일 세션).
-            Composer.Instance.AddPart<IDataQueueHandler>(brokerage);
+            var s = KisSettings.FromBrokerageData(job.BrokerageData);
+            if (string.IsNullOrEmpty(s.TokenFile) || string.IsNullOrEmpty(s.SecretsFile))
+                throw new StockappException("kis-token-file and kis-secrets-file are required: this adapter runs under stockapp, which issues tokens");
+            if (string.IsNullOrEmpty(s.LedgerView))
+                throw new StockappException("kis-ledger-view is required: holdings and cash come from the strategy ledger");
+            if (!Regex.IsMatch(s.AccountNo ?? "", "^[0-9]{8}-[0-9]{2}$") || string.IsNullOrEmpty(s.HtsId))
+                throw new StockappException("kis-account-no (12345678-01) and kis-hts-id are required");
+            var brokerage = new KisBrokerage(algorithm, s);
+            Composer.Instance.AddPart<IDataQueueHandler>(brokerage);  // prices and orders share one session
             return brokerage;
         }
 
-        public override void Dispose() { /* NOP */ }
+        public override void Dispose() { }
     }
 }

@@ -27,8 +27,12 @@ namespace MyTrading.Kis
         {
             if (string.IsNullOrEmpty(brokerageSymbol))
                 throw new ArgumentException("KIS 종목코드가 비었습니다.", nameof(brokerageSymbol));
-            return Symbol.Create(brokerageSymbol, securityType,
-                string.IsNullOrEmpty(market) ? KisConstants.KrxMarket : market);
+            var m = string.IsNullOrEmpty(market) ? KisConstants.KrxMarket : market;
+            // Equities skip LEAN's map-file lookup (krx has no map files, so the SID is the same either way;
+            // TossSymbolMapper.LeanSymbol does the same) and need no registered IMapFileProvider.
+            return securityType == SecurityType.Equity
+                ? new Symbol(SecurityIdentifier.GenerateEquity(brokerageSymbol, m, mapSymbol: false), brokerageSymbol)
+                : Symbol.Create(brokerageSymbol, securityType, m);
         }
     }
 }
