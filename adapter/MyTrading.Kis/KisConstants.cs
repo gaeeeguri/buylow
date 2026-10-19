@@ -76,5 +76,14 @@ namespace MyTrading.Kis
 
         public static string RestUrl(string env) => IsDemo(env) ? DemoRestUrl : RealRestUrl;
         public static string WsUrl(string env) => IsDemo(env) ? DemoWsUrl : RealWsUrl;
+
+        // ── stockapp mode ─────────────────────────────────────────────────
+        public const string PathDailyCcld = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld";
+        public const string PathInquirePrice = "/uapi/domestic-stock/v1/quotations/inquire-price";
+        public const string TrDailyCcldReal = "TTTC0081R";   // 3개월 이내 일별 주문체결 (demo: V)
+        public const string TrInquirePrice = "FHKST01010100"; // 현재가·상하한가 (실전/모의 공통)
+        public const string ExchangeKrx = "KRX";              // 주문은 KRX 고정 (시가 단일가, NXT/SOR 금지)
+        public const string ExchangeAll = "ALL";              // 조회는 전체 (NXT의 외부 주문도 보이게)
+        public static readonly string[] AuthCodes = { "EGW00121", "EGW00123" };  // 무효 / 만료 토큰
     }
 }
