@@ -117,22 +117,27 @@ namespace MyTrading.Kis
                                  FillTime = f[11], IsFilled = f[13] == "2" };
         }
 
+        private static string Str(JToken t) => t is JValue v ? v.Value?.ToString() : null;
+
         public static KisFrame Parse(string text, string key, string iv)
         {
             if (string.IsNullOrEmpty(text)) return new KisFrame();
             if (text[0] == '{')
             {
-                JObject o;
-                try { o = JObject.Parse(text); } catch { return new KisFrame(); }
-                var tr = o["header"]?.Value<string>("tr_id");
-                if (tr == "PINGPONG") return new KisFrame { Kind = KisFrameKind.Ping, TrId = tr };
-                var body = o["body"] as JObject;
-                var output = body?["output"] as JObject;
-                return new KisFrame
+                try
                 {
-                    Kind = KisFrameKind.Ack, TrId = tr, Key = output?.Value<string>("key"), Iv = output?.Value<string>("iv"),
-                    AckOk = body?.Value<string>("rt_cd") != "1", AckMessage = body?.Value<string>("msg1"),
-                };
+                    var o = JObject.Parse(text);
+                    var tr = Str((o["header"] as JObject)?["tr_id"]);
+                    if (tr == "PINGPONG") return new KisFrame { Kind = KisFrameKind.Ping, TrId = tr };
+                    var body = o["body"] as JObject;
+                    var output = body?["output"] as JObject;
+                    return new KisFrame
+                    {
+                        Kind = KisFrameKind.Ack, TrId = tr, Key = Str(output?["key"]), Iv = Str(output?["iv"]),
+                        AckOk = Str(body?["rt_cd"]) != "1", AckMessage = Str(body?["msg1"]),
+                    };
+                }
+                catch (Exception) { return new KisFrame(); }
             }
             var parts = text.Split(new[] { '|' }, 4);
             if (parts.Length < 4) return new KisFrame();
@@ -175,7 +180,11 @@ namespace MyTrading.Kis
             _thread.Start();
         }
 
-        public void Stop() { try { _cts?.Cancel(); } catch { } }
+        public void Stop()
+        {
+            try { _cts?.Cancel(); } catch { }
+            lock (_lock) { try { _current?.Abort(); } catch { } }
+        }
 
         private void Run()
         {
@@ -183,10 +192,15 @@ namespace MyTrading.Kis
             var failures = 0;
             while (!token.IsCancellationRequested)
             {
-                try { RunOnce(token); failures = 0; }
-                catch (Exception e) when (!token.IsCancellationRequested) { Log.Trace($"KisSocket: {e.GetType().Name}: {e.Message}"); }
+                try { if (RunOnce(token)) failures = 0; }
+                catch (Exception e)
+                {
+                    if (token.IsCancellationRequested) break;
+                    Log.Trace($"KisSocket: {e.GetType().Name}: {e.Message}");
+                }
                 Connected = false;
                 DownSince ??= DateTime.UtcNow;
+                if (token.IsCancellationRequested) break;
                 token.WaitHandle.WaitOne(TimeSpan.FromSeconds(Backoff[Math.Min(failures++, Backoff.Length - 1)]));
             }
         }
@@ -194,7 +208,7 @@ namespace MyTrading.Kis
         private static void Send(ClientWebSocket ws, string text, CancellationToken stop) =>
             ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(text)), WebSocketMessageType.Text, true, stop).GetAwaiter().GetResult();
 
-        private void RunOnce(CancellationToken stop)
+        private bool RunOnce(CancellationToken stop)
         {
             using var ws = new ClientWebSocket();
             if (!string.IsNullOrEmpty(_settings.Proxy) && _settings.Proxy != "direct")
@@ -228,7 +242,7 @@ namespace MyTrading.Kis
                     do
                     {
                         r = ws.ReceiveAsync(new ArraySegment<byte>(buffer), stop).GetAwaiter().GetResult();
-                        if (r.MessageType == WebSocketMessageType.Close) return;
+                        if (r.MessageType == WebSocketMessageType.Close) return true;
                         text.Append(Encoding.UTF8.GetString(buffer, 0, r.Count));
                     } while (!r.EndOfMessage);
                     var raw = text.ToString();
@@ -241,13 +255,14 @@ namespace MyTrading.Kis
                         {
                             AuthFailures++;
                             _invalidate();
-                            return;  // reconnect with the backend's current approval key
+                            return false;  // reconnect with the backend's current approval key
                         }
                         if (f.AckOk) AuthFailures = 0;
                         continue;
                     }
                     _onFrame(f);
                 }
+                return true;
             }
             finally
             {

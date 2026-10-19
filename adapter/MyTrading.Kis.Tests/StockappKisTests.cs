@@ -282,6 +282,19 @@ namespace MyTrading.Kis.Tests
             Assert.Equal((KisFrameKind.Fill, (string)null), (blind.Kind, blind.OrderNo));  // still a wake-up
         }
 
+        [Theory]
+        [InlineData("{\"header\":null}")]
+        [InlineData("{\"header\":5}")]
+        [InlineData("{\"header\":{\"tr_id\":{}}}")]
+        [InlineData("{\"header\":{\"tr_id\":\"H0STCNI9\"},\"body\":[]}")]
+        [InlineData("[1,2]")]
+        [InlineData("{\"header\":{\"tr_id\":\"H0STCNI9\"},\"body\":{\"output\":5,\"rt_cd\":{}}}")]
+        public void Odd_json_never_throws(string text)
+        {
+            var f = KisSocket.Parse(text, null, null);
+            Assert.True(f.Kind == KisFrameKind.Other || f.Kind == KisFrameKind.Ack);
+        }
+
         [Fact]
         public void A_trade_frame_is_a_tick()
         {
