@@ -42,7 +42,7 @@ namespace MyTrading.Kis
     /// <summary>One inquire-daily-ccld row. Revise/cancel requests are rows of their own (orgn_odno set).</summary>
     public class KisOrderRow
     {
-        public string Day, Branch, Odno, Symbol;
+        public string Day, Branch, Odno, OrigOdno = "", Symbol;
         public bool Buy, Revision;
         public string CnclYn = "";
         public decimal Qty, Price, Filled, Avg, Remaining, Cancelled, Rejected;
@@ -57,11 +57,28 @@ namespace MyTrading.Kis
             Day = r.Value<string>("ord_dt") ?? "", Branch = r.Value<string>("ord_gno_brno") ?? "",
             Odno = r.Value<string>("odno") ?? "", Symbol = r.Value<string>("pdno") ?? "",
             Buy = r.Value<string>("sll_buy_dvsn_cd") == "02",
+            OrigOdno = r.Value<string>("orgn_odno") ?? "",
             Revision = (r.Value<string>("orgn_odno") ?? "").Trim('0', ' ').Length > 0,
             Qty = D(r, "ord_qty"), Price = D(r, "ord_unpr"), Filled = D(r, "tot_ccld_qty"), Avg = D(r, "avg_prvs"),
             CnclYn = r.Value<string>("cncl_yn") ?? "",
             Remaining = D(r, "rmn_qty"), Cancelled = D(r, "cncl_cfrm_qty"), Rejected = D(r, "rjct_qty"),
         };
+
+        /// <summary>A cancel may be confirmed only on its own revision row (orgn_odno = the original, same day):
+        /// its cncl_cfrm_qty is added to the original's cancelled quantity and taken off the original's remaining
+        /// (never below 0), so the original's state sees it. The same fold as stockapp's `fold_cancels`.</summary>
+        public static List<KisOrderRow> Fold(List<KisOrderRow> rows)
+        {
+            foreach (var rev in rows.Where(r => r.Revision && r.Cancelled > 0))
+            {
+                var orig = rows.FirstOrDefault(o => !o.Revision && o.Day == rev.Day &&
+                                                    KisOrderId.Pad(o.Odno, KisOrderId.OdnoDigits) == KisOrderId.Pad(rev.OrigOdno, KisOrderId.OdnoDigits));
+                if (orig == null) continue;
+                orig.Cancelled += rev.Cancelled;
+                orig.Remaining = Math.Max(0m, orig.Remaining - rev.Cancelled);
+            }
+            return rows;
+        }
 
         /// <summary>The same mapping as stockapp's `kis_state` (stockapp/kis/account.py).</summary>
         public string State(string today)
@@ -281,7 +298,7 @@ namespace MyTrading.Kis
             {
                 var data = Get(KisConstants.PathDailyCcld, Tr(KisConstants.TrDailyCcldReal, _s.Demo), q, cont, out var more);
                 foreach (var r in (data["output1"] as JArray) ?? new JArray()) rows.Add(KisOrderRow.Parse((JObject)r));
-                if (more != "M" && more != "F") return rows;
+                if (more != "M" && more != "F") return KisOrderRow.Fold(rows);
                 q["CTX_AREA_FK100"] = data.Value<string>("ctx_area_fk100") ?? "";
                 q["CTX_AREA_NK100"] = data.Value<string>("ctx_area_nk100") ?? "";
                 cont = "N";
@@ -293,7 +310,7 @@ namespace MyTrading.Kis
         /// terminal state still comes from the daily orders.</summary>
         public bool Cancel(string orderId)
         {
-            if (!KisOrderId.TryParse(orderId, out _, out var branch, out var odno)) return false;
+            if (!KisOrderId.TryParse(KisOrderId.Canonical(orderId), out _, out var branch, out var odno)) return false;
             var body = new JObject
             {
                 ["CANO"] = _s.Cano, ["ACNT_PRDT_CD"] = _s.Product, ["KRX_FWDG_ORD_ORGNO"] = branch, ["ORGN_ODNO"] = odno,

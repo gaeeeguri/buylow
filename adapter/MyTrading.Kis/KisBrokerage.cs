@@ -127,6 +127,9 @@ namespace MyTrading.Kis
             else if (order.Symbol.SecurityType != SecurityType.Equity || order.Symbol.ID.Market != KisConstants.KrxMarket)
                 refusal = "KIS trades KR (krx) equities only";
             var limit = order is LimitOrder lo ? lo.LimitPrice : 0m;
+            // KIS takes whole won and whole shares; never let the body round them silently
+            if (refusal == null && (limit != decimal.Truncate(limit) || order.AbsoluteQuantity != decimal.Truncate(order.AbsoluteQuantity)))
+                refusal = "price and quantity must be whole";
             string pdno = null;
             (decimal, decimal)? limits = null;
             if (refusal == null)
@@ -226,13 +229,16 @@ namespace MyTrading.Kis
                 _restOkAt = _utcNow();
                 foreach (var id in ids)
                 {
-                    var row = rows.FirstOrDefault(r => !r.Revision && r.OrderId == id);
+                    // matched on the canonical id, so an id kept with other padding still finds its row
+                    var row = rows.FirstOrDefault(r => !r.Revision && KisOrderId.Same(r.OrderId, id));
                     if (row == null) continue;
                     // Not yet known to LEAN (e.g. between GetOpenOrders and AddOpenOrder at startup): leave the
                     // increment unobserved so a later refresh reports it instead of losing it.
                     var orders = _ordersByBrokerId(id) ?? new List<Order>();
                     if (orders.Count == 0) continue;
-                    var step = _fills.Observe(row.Snapshot(today));
+                    var snapshot = row.Snapshot(today);
+                    snapshot.OrderId = id;  // the tracker and LEAN know the order by the id they were given
+                    var step = _fills.Observe(snapshot);
                     if (step == null) continue;
                     var status = step.Status switch
                     {

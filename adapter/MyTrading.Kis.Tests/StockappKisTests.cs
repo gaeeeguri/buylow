@@ -211,6 +211,78 @@ namespace MyTrading.Kis.Tests
             Assert.False(KisOrderId.TryParse("0000117057", out _, out _, out _));
         }
 
+        [Theory]
+        [InlineData("91252", "117057")]
+        [InlineData("91252", "0000117057")]
+        [InlineData("0091252", "117057")]
+        [InlineData("00091252", "00000000117057")]
+        public void Order_ids_are_canonical_whatever_padding_KIS_answers_with(string branch, string odno)
+        {
+            Assert.Equal("20261015:91252:0000117057", KisOrderId.Format("20261015", branch, odno));
+            Assert.Equal("20261015:91252:0000117057", KisOrderId.Canonical("20261015:" + branch + ":" + odno));
+            Assert.True(KisOrderId.Same("20261015:" + branch + ":" + odno, "20261015:91252:0000117057"));
+            Assert.False(KisOrderId.Same("20261014:" + branch + ":" + odno, "20261015:91252:0000117057"));
+        }
+
+        [Fact]
+        public void An_order_cash_id_and_its_ccld_row_are_byte_identical()
+        {
+            var (rest, h, _, _) = KisFixture.Rest();
+            h.On("POST " + KisFixture.Cash, KisStub.Json(HttpStatusCode.OK,
+                KisFixture.Ok("{\"KRX_FWDG_ORD_ORGNO\":\"91252\",\"ODNO\":\"117057\",\"ORD_TMD\":\"091512\"}")));
+            var sent = rest.SendOrder(true, "005930", 2, 72100m);
+            var row = KisOrderRow.Parse(JObject.Parse(KisFixture.Row("0000117057", "0", "0", "10")));
+            var padded = JObject.Parse(KisFixture.Row("0000117057", "0", "0", "10"));
+            padded["ord_gno_brno"] = "0091252";
+            Assert.Equal((SendKind.Accepted, "20261015:91252:0000117057"), (sent.Kind, sent.OrderId));
+            Assert.Equal(sent.OrderId, row.OrderId);
+            Assert.Equal(sent.OrderId, KisOrderRow.Parse(padded).OrderId);
+        }
+
+        [Fact]
+        public void A_cancel_confirmed_only_on_the_revision_row_cancels_the_original()
+        {
+            var rows = new List<KisOrderRow>
+            {
+                KisOrderRow.Parse(JObject.Parse(KisFixture.Row("0000117057", "0", "0", "10", cancelled: "0"))),
+                KisOrderRow.Parse(JObject.Parse(KisFixture.Row("0000117058", "0", "0", "0", orgn: "0000117057", cancelled: "10", cnclYn: "Y"))),
+            };
+            var folded = KisOrderRow.Fold(rows);
+            Assert.Equal(("CANCELED", 0m), (folded[0].State("20261015"), folded[0].Remaining));
+            // a partly filled original: the cancel takes the rest; remaining never goes below zero
+            var partial = KisOrderRow.Fold(new List<KisOrderRow>
+            {
+                KisOrderRow.Parse(JObject.Parse(KisFixture.Row("0000117057", "4", "70000", "6"))),
+                KisOrderRow.Parse(JObject.Parse(KisFixture.Row("0000117058", "0", "0", "0", orgn: "117057", cancelled: "10"))),
+            });
+            Assert.Equal(("CANCELED", 0m, 4m), (partial[0].State("20261015"), partial[0].Remaining, partial[0].Filled));
+            // the shape seen so far (confirmation on the original, echoed on the revision) is still CANCELED
+            var both = KisOrderRow.Fold(new List<KisOrderRow>
+            {
+                KisOrderRow.Parse(JObject.Parse(KisFixture.Row("0000117057", "0", "0", "0", cancelled: "10"))),
+                KisOrderRow.Parse(JObject.Parse(KisFixture.Row("0000117058", "0", "0", "0", orgn: "0000117057", cancelled: "10", cnclYn: "Y"))),
+            });
+            Assert.Equal(("CANCELED", 0m), (both[0].State("20261015"), both[0].Remaining));
+            // a revision of another day's order is not folded into today's
+            var otherDay = KisOrderRow.Fold(new List<KisOrderRow>
+            {
+                KisOrderRow.Parse(JObject.Parse(KisFixture.Row("0000117057", "0", "0", "10"))),
+                KisOrderRow.Parse(JObject.Parse(KisFixture.Row("0000117058", "0", "0", "0", day: "20261014", orgn: "0000117057", cancelled: "10"))),
+            });
+            Assert.Equal("ACCEPTED", otherDay[0].State("20261015"));
+        }
+
+        [Fact]
+        public void Daily_orders_fold_a_cancel_confirmed_on_the_revision_row()
+        {
+            var (rest, h, _, _) = KisFixture.Rest();
+            h.On("GET " + KisFixture.Ccld, KisStub.Json(HttpStatusCode.OK, KisFixture.Rows(
+                KisFixture.Row("0000117057", "0", "0", "10"),
+                KisFixture.Row("0000117058", "0", "0", "0", orgn: "0000117057", cancelled: "10", cnclYn: "Y"))));
+            var rows = rest.DailyOrders("20261015", "20261015");
+            Assert.Equal("CANCELED", rows.Single(r => !r.Revision).State("20261015"));
+        }
+
         [Fact]
         public void Kis_rows_feed_the_shared_fill_logic()
         {
@@ -325,10 +397,10 @@ namespace MyTrading.Kis.Tests
 
         private static (KisBrokerage b, KisStub h, List<QuantConnect.Orders.OrderEvent> events,
                         List<QuantConnect.Brokerages.BrokerageMessageEvent> messages, Dictionary<string, List<QuantConnect.Orders.Order>> byId)
-            Make(bool trading = true, Func<DateTime> now = null, KisSocket socket = null)
+            Make(bool trading = true, Func<DateTime> now = null, KisSocket socket = null, string view = null)
         {
             var (rest, h, dir, _) = KisFixture.Rest(trading, now);
-            File.WriteAllText(Path.Combine(dir, "ledger-view.json"), View);
+            File.WriteAllText(Path.Combine(dir, "ledger-view.json"), view ?? View);
             var byId = new Dictionary<string, List<QuantConnect.Orders.Order>>();
             var b = new KisBrokerage(null, KisFixture.Settings(dir, trading), rest, new NoAggregator(),
                                      id => byId.TryGetValue(id, out var l) ? l : new List<QuantConnect.Orders.Order>(), now ?? (() => KisFixture.Now), socket);
@@ -364,6 +436,33 @@ namespace MyTrading.Kis.Tests
                          events.Select(e => e.Message));
             Assert.All(events, e => Assert.Equal(QuantConnect.Orders.OrderStatus.Invalid, e.Status));
             Assert.Empty(h.Seen);
+        }
+
+        [Theory]
+        [InlineData(2, 72100.5)]
+        [InlineData(2.5, 72100)]
+        public void A_fractional_price_or_quantity_is_refused_before_any_request(double qty, double limit)
+        {
+            var (b, h, events, _, _) = Make();
+            Quote(h);
+            Assert.False(b.PlaceOrder(new QuantConnect.Orders.LimitOrder(Samsung, (decimal)qty, (decimal)limit, DateTime.UtcNow, Tag)));
+            var e = Assert.Single(events);
+            Assert.Equal((QuantConnect.Orders.OrderStatus.Invalid, "guardrail: price and quantity must be whole"), (e.Status, e.Message));
+            Assert.Empty(h.Seen);
+        }
+
+        [Fact]
+        public void A_fill_on_an_id_the_ledger_kept_unpadded_is_still_matched()
+        {
+            // an open order the ledger kept as "…:117050" is the ccld row "0000117050"
+            var (b, h, events, _, byId) = Make(view: View.Replace("0000117050", "117050"));
+            var open = Assert.Single(b.GetOpenOrders());
+            Assert.Equal("20261015:91252:117050", open.BrokerId.Single());
+            byId["20261015:91252:117050"] = new List<QuantConnect.Orders.Order> { open };
+            h.On("GET " + KisFixture.Ccld, KisStub.Json(HttpStatusCode.OK, KisFixture.Rows(KisFixture.Row("0000117050", "4", "70000", "6"))));
+            b.Poll(KisFixture.Now.AddSeconds(31));
+            var fill = Assert.Single(events);
+            Assert.Equal((QuantConnect.Orders.OrderStatus.PartiallyFilled, 3m), (fill.Status, fill.FillQuantity));
         }
 
         [Fact]
