@@ -61,11 +61,11 @@ namespace MyTrading.Kis.Tests
         public const string Accepted = "{\"KRX_FWDG_ORD_ORGNO\":\"91252\",\"ODNO\":\"0000117057\",\"ORD_TMD\":\"091512\"}";
 
         public static string Row(string odno, string filled, string avg, string rmn, string day = "20261015",
-                                 string orgn = "", string cancelled = "0") =>
+                                 string orgn = "", string cancelled = "0", string cnclYn = "N") =>
             "{\"ord_dt\":\"" + day + "\",\"ord_gno_brno\":\"91252\",\"odno\":\"" + odno + "\",\"orgn_odno\":\"" + orgn +
             "\",\"sll_buy_dvsn_cd\":\"02\",\"pdno\":\"005930\",\"ord_qty\":\"10\",\"ord_unpr\":\"70000\",\"ord_tmd\":\"091512\"," +
             "\"tot_ccld_qty\":\"" + filled + "\",\"avg_prvs\":\"" + avg + "\",\"rmn_qty\":\"" + rmn + "\",\"cncl_cfrm_qty\":\"" +
-            cancelled + "\",\"rjct_qty\":\"0\",\"cncl_yn\":\"N\"}";
+            cancelled + "\",\"rjct_qty\":\"0\",\"cncl_yn\":\"" + cnclYn + "\"}";
 
         public static string Rows(params string[] rows) =>
             "{\"rt_cd\":\"0\",\"msg_cd\":\"0\",\"msg1\":\"ok\",\"output1\":[" + string.Join(",", rows) +
@@ -164,6 +164,15 @@ namespace MyTrading.Kis.Tests
         }
 
         [Fact]
+        public void An_odd_body_shape_is_uncertain_and_sent_once()
+        {
+            var (rest, h, _, _) = KisFixture.Rest();
+            h.On("POST " + KisFixture.Cash, KisStub.Json(HttpStatusCode.OK, "{\"rt_cd\":\"0\",\"output\":\"not-an-object\"}"));
+            Assert.Equal(SendKind.Uncertain, rest.SendOrder(true, "005930", 2, 72100m).Kind);
+            Assert.Single(h.Seen);
+        }
+
+        [Fact]
         public void Daily_orders_follow_tr_cont_and_parse_rows()
         {
             var (rest, h, _, _) = KisFixture.Rest();
@@ -183,11 +192,12 @@ namespace MyTrading.Kis.Tests
         [Theory]
         [InlineData("10", "70000", "0", "0", "20261015", "FILLED")]
         [InlineData("4", "70000", "0", "6", "20261015", "CANCELED")]
+        [InlineData("0", "0", "0", "0", "20261015", "CANCELED", "Y")]
         [InlineData("0", "0", "10", "0", "20261014", "EXPIRED")]
         [InlineData("0", "0", "10", "0", "20261015", "ACCEPTED")]
-        public void Row_states(string filled, string avg, string rmn, string cancelled, string day, string state)
+        public void Row_states(string filled, string avg, string rmn, string cancelled, string day, string state, string cnclYn = "N")
         {
-            var row = KisOrderRow.Parse(JObject.Parse(KisFixture.Row("1", filled, avg, rmn, day, cancelled: cancelled)));
+            var row = KisOrderRow.Parse(JObject.Parse(KisFixture.Row("1", filled, avg, rmn, day, cancelled: cancelled, cnclYn: cnclYn)));
             Assert.Equal(state, row.State("20261015"));
         }
 

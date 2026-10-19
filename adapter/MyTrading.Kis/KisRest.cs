@@ -44,6 +44,7 @@ namespace MyTrading.Kis
     {
         public string Day, Branch, Odno, Symbol;
         public bool Buy, Revision;
+        public string CnclYn = "";
         public decimal Qty, Price, Filled, Avg, Remaining, Cancelled, Rejected;
 
         public string OrderId => KisOrderId.Format(Day, Branch, Odno);
@@ -58,6 +59,7 @@ namespace MyTrading.Kis
             Buy = r.Value<string>("sll_buy_dvsn_cd") == "02",
             Revision = (r.Value<string>("orgn_odno") ?? "").Trim('0', ' ').Length > 0,
             Qty = D(r, "ord_qty"), Price = D(r, "ord_unpr"), Filled = D(r, "tot_ccld_qty"), Avg = D(r, "avg_prvs"),
+            CnclYn = r.Value<string>("cncl_yn") ?? "",
             Remaining = D(r, "rmn_qty"), Cancelled = D(r, "cncl_cfrm_qty"), Rejected = D(r, "rjct_qty"),
         };
 
@@ -65,7 +67,7 @@ namespace MyTrading.Kis
         public string State(string today)
         {
             if (Qty > 0 && Filled >= Qty) return "FILLED";
-            if (Remaining == 0 && Cancelled > 0) return "CANCELED";
+            if (Remaining == 0 && (Cancelled > 0 || CnclYn == "Y")) return "CANCELED";
             if (Remaining == 0 && Rejected > 0) return "REJECTED";
             if (string.CompareOrdinal(Day, today) < 0) return "EXPIRED";  // a KRX day order ends at the close
             return Filled > 0 ? "PARTIAL" : "ACCEPTED";
@@ -143,7 +145,8 @@ namespace MyTrading.Kis
             lock (_gate)
             {
                 var since = _utcNow() - _last;
-                if (since < interval) _sleep(interval - since);
+                var wait = interval - since;
+                if (wait > TimeSpan.Zero && wait <= interval) _sleep(wait);  // a clock jump can never stall it
                 _last = _utcNow();
             }
         }
@@ -210,6 +213,12 @@ namespace MyTrading.Kis
                 {
                     return new SendResult { Kind = SendKind.Uncertain, Code = "transport", Message = e.GetType().Name };
                 }
+                catch (Exception e)
+                {
+                    return new SendResult { Kind = SendKind.Uncertain, Code = "error", Message = e.GetType().Name };
+                }
+                try
+                {
                 var code = data?.Value<string>("msg_cd") ?? "";
                 if (code == RateLimit && rateRetries < 3) { rateRetries++; _sleep(TimeSpan.FromSeconds(1)); continue; }
                 if (KisConstants.AuthCodes.Contains(code) && !reauthed)
@@ -232,6 +241,11 @@ namespace MyTrading.Kis
                 if (status == 200 && data?["rt_cd"] != null)
                     return new SendResult { Kind = SendKind.Rejected, Code = code, Message = data.Value<string>("msg1") };
                 return new SendResult { Kind = SendKind.Uncertain, Code = "http-" + status, Message = code };
+                }
+                catch (Exception e)
+                {
+                    return new SendResult { Kind = SendKind.Uncertain, Code = "error", Message = e.GetType().Name };
+                }
             }
         }
 
